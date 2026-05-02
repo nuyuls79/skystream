@@ -21,10 +21,35 @@ class CloudflareBypass {
   /// Active background WebView sessions indexed by normalized host.
   final Map<String, _HostWebView> _hostWebViews = {};
 
-  /// Global Mutex to serialize all Cloudflare operations system-wide.
-  /// Prevents spawning multiple HeadlessInAppWebViews concurrently, which
-  /// causes severe GPU/RAM exhaustion on Android and macOS.
-  Future<void>? _globalLock;
+  /// Per-host deduplication: if we're already solving CF for a host,
+  /// new callers share the same Future instead of spawning a second WebView.
+  final Map<String, Future<CfResult?>> _activeByHost = {};
+
+  /// Limits concurrent WebView spawns to prevent GPU/RAM exhaustion.
+  /// Each HeadlessInAppWebView spawn triggers a full Vulkan/GPU context init
+  /// on Android — doing two simultaneously causes severe frame drops (40+
+  /// skipped frames). Reusing existing cached sessions bypasses this limit.
+  static const _maxConcurrentSpawns = 1;
+  int _spawningCount = 0;
+  final _spawnQueue = <Completer<void>>[];
+
+  Future<void> _acquireSpawnSlot() async {
+    if (_spawningCount < _maxConcurrentSpawns) {
+      _spawningCount++;
+      return;
+    }
+    final waiter = Completer<void>();
+    _spawnQueue.add(waiter);
+    await waiter.future;
+  }
+
+  void _releaseSpawnSlot() {
+    if (_spawnQueue.isNotEmpty) {
+      _spawnQueue.removeAt(0).complete();
+    } else {
+      _spawningCount--;
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Detection
@@ -54,6 +79,10 @@ class CloudflareBypass {
   // ---------------------------------------------------------------------------
 
   /// Solves the CF challenge and returns the actual page HTML.
+  ///
+  /// Different hosts solve concurrently. Same-host calls share one in-flight
+  /// Future. At most [_maxConcurrentSpawns] WebViews are spawned at once to
+  /// avoid GPU/RAM exhaustion; cached sessions are reused for free.
   Future<CfResult?> solveAndFetch(
     String url, {
     Future<void> Function(String host)? onSolved,
@@ -64,53 +93,57 @@ class CloudflareBypass {
     if (rawHost.isEmpty) return null;
     final host = _normalizeHost(rawHost);
 
-    // Serialize ALL operations globally to avoid WebView explosion.
-    final prevLock = _globalLock ?? Future.value();
-    final completer = Completer<void>();
-    _globalLock = completer.future;
+    // 1. Deduplicate: share an already-running solve for the same host.
+    final inFlight = _activeByHost[host];
+    if (inFlight != null) {
+      if (kDebugMode) debugPrint('$_tag Joining in-flight solve for $host');
+      return inFlight;
+    }
 
-    try {
-      await prevLock;
-
-      // 1. Try reusing an existing session
-      final existingView = _hostWebViews[host];
-      if (existingView != null) {
-        if (kDebugMode) debugPrint('$_tag Reusing WebView for $host → $url');
-        try {
-          final html = await existingView.navigate(url);
-          if (html != null) {
-            if (!html.contains('_cf_chl_opt') &&
-                !html.contains('Just a moment')) {
-              return CfResult(body: html, statusCode: 200, finalUrl: url);
-            } else {
-              if (kDebugMode) {
-                debugPrint('$_tag Challenge recurred for $host, disposing');
-              }
-              await _disposeHostSession(host);
-            }
-          } else {
-            // Reused session failed (timeout or dead engine).
-            // Proactively dispose and FALL THROUGH to Fresh Solve.
-            if (kDebugMode) {
-              debugPrint('$_tag Reused WebView failed/timed out, falling back');
-            }
-            await _disposeHostSession(host);
-          }
-        } catch (e) {
-          if (kDebugMode) debugPrint('$_tag Reused WebView error: $e');
-          await _disposeHostSession(host);
+    // 2. Try reusing a cached solved session (free — no spawn slot needed).
+    final cachedView = _hostWebViews[host];
+    if (cachedView != null) {
+      if (kDebugMode) debugPrint('$_tag Reusing cached WebView for $host → $url');
+      try {
+        final html = await cachedView.navigate(url);
+        if (html != null &&
+            !html.contains('_cf_chl_opt') &&
+            !html.contains('Just a moment')) {
+          return CfResult(body: html, statusCode: 200, finalUrl: url);
         }
+        if (kDebugMode) debugPrint('$_tag Cached session stale for $host, disposing');
+        await _disposeHostSession(host);
+      } catch (e) {
+        if (kDebugMode) debugPrint('$_tag Cached WebView error: $e');
+        await _disposeHostSession(host);
       }
+    }
 
-      // 2. Fresh Solve
+    // 3. Fresh solve — register future before any await so concurrent callers
+    //    for this host share it rather than spawning duplicate WebViews.
+    final future = _freshSolve(url, host, onSolved: onSolved);
+    _activeByHost[host] = future;
+    try {
+      return await future;
+    } finally {
+      final orphan = _activeByHost.remove(host);
+      if (orphan != null) unawaited(orphan);
+    }
+  }
+
+  /// Acquires a spawn slot, runs a fresh WebView solve, then releases the slot.
+  Future<CfResult?> _freshSolve(
+    String url,
+    String host, {
+    Future<void> Function(String host)? onSolved,
+  }) async {
+    await _acquireSpawnSlot();
+    try {
       final result = await _fetchViaWebView(url, host);
-      if (result != null && onSolved != null) {
-        await onSolved(host);
-      }
+      if (result != null && onSolved != null) await onSolved(host);
       return result;
     } finally {
-      completer.complete();
-      if (_globalLock == completer.future) _globalLock = null;
+      _releaseSpawnSlot();
     }
   }
 
@@ -142,38 +175,40 @@ class CloudflareBypass {
       InAppWebViewController controller,
       String? currentUrl,
     ) async {
+      if (solved) return;
       try {
+        // Cheap check: one tiny JS call, no DOM serialization.
+        // Returns '1' when the CF challenge is gone, '0' while it's active.
+        final isClear = await controller.evaluateJavascript(source: '''
+          (function(){
+            var t = document.title || '';
+            var hasChallenge =
+                t === 'Just a moment...' ||
+                t.toLowerCase().indexOf('cloudflare') !== -1 ||
+                !!document.getElementById('challenge-form') ||
+                !!document.querySelector('[data-translate="checking_browser"]') ||
+                !!document.querySelector('.cf-mitigated-content') ||
+                typeof window._cf_chl_opt !== 'undefined';
+            return hasChallenge ? '0' : '1';
+          })()
+        ''');
+
+        if (isClear != '1') return;
+
+        // Challenge cleared — fetch full HTML exactly once.
         final html = await controller.evaluateJavascript(
           source: 'document.documentElement.outerHTML',
         );
         final body = html?.toString();
+        if (body == null || body.isEmpty) return;
 
-        if (body != null &&
-            !body.contains('_cf_chl_opt') &&
-            !body.contains('Just a moment')) {
-          holder.hostView?.onLoaded(body);
-        }
-
-        if (solved) return;
-        final title = await controller.getTitle();
-        if (title == null ||
-            title.isEmpty ||
-            title.toLowerCase().contains('cloudflare') ||
-            title.contains('Just a moment')) {
-          return;
-        }
-
-        if (body != null &&
-            body.isNotEmpty &&
-            !body.contains('_cf_chl_opt') &&
-            !body.contains('Just a moment')) {
-          result = CfResult(
-            body: body,
-            statusCode: 200,
-            finalUrl: currentUrl ?? url,
-          );
-          solved = true;
-        }
+        result = CfResult(
+          body: body,
+          statusCode: 200,
+          finalUrl: currentUrl ?? url,
+        );
+        solved = true;
+        holder.hostView?.onLoaded(body);
       } catch (_) {}
     }
 
@@ -205,7 +240,7 @@ class CloudflareBypass {
       // content-protector.min.js polls the DOM in a tight setInterval,
       // flooding the platform channel with ~40 calls/sec of serialized
       // "[object Object]" strings).
-      onConsoleMessage: (_, __) {},
+      onConsoleMessage: (_, _) {},
     );
 
     try {
@@ -334,19 +369,32 @@ class _HostWebView {
     } catch (_) {}
   }
 
-  /// Override all console methods on the loaded page to prevent scripts
-  /// (e.g. cinemacity's content-protector.min.js) from flooding logcat
-  /// and the InAppWebView method-channel debug layer.
+  /// Permanently seal all console methods so page scripts (e.g. cinemacity's
+  /// content-protector.min.js running in a setInterval) cannot re-enable them
+  /// and flood the platform channel with serialized messages.
+  ///
+  /// Simple assignment (`console.log = noop`) is undone by any script that
+  /// re-assigns afterward. `Object.defineProperty` with configurable:false
+  /// makes the property non-writable and non-configurable — subsequent writes
+  /// silently no-op even inside setInterval callbacks.
   Future<void> silenceConsole() async {
     if (_disposed || _controller == null) return;
     try {
       await _controller.evaluateJavascript(source: '''
         (function() {
           var noop = function(){};
-          console.log = noop;
-          console.info = noop;
-          console.debug = noop;
-          console.warn = noop;
+          var methods = ['log','info','debug','warn','error','dir','table',
+                         'trace','group','groupCollapsed','groupEnd','clear',
+                         'count','assert','time','timeLog','timeEnd','timeStamp'];
+          methods.forEach(function(m) {
+            try {
+              Object.defineProperty(console, m, {
+                get: function(){ return noop; },
+                set: function(){},
+                configurable: false
+              });
+            } catch(_) {}
+          });
         })();
       ''');
     } catch (_) {}

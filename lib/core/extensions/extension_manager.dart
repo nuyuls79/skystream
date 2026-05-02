@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'base_provider.dart';
 
@@ -20,6 +21,10 @@ class ExtensionManager extends _$ExtensionManager {
   JsEngineService? _engine;
   PluginStorageService? _storageService;
   Future<void>? _syncLock;
+
+  // Shared script read futures — one per plugin package. Sub-providers that
+  // share the same JS file reuse the same Future so the file is read only once.
+  final Map<String, Future<String?>> _pluginScriptFutures = {};
 
   @override
   List<SkyStreamProvider> build() {
@@ -191,15 +196,16 @@ class ExtensionManager extends _$ExtensionManager {
     return storage.getExtensionData('$packageName:_provider_enabled_$providerId') != 'false';
   }
 
-  /// Loads a plugin and returns all resulting provider instances.
-  /// For plugins with a `providers` array, fans out one instance per enabled sub-provider.
-  /// For regular plugins, returns a single-element list.
+  /// Registers shell providers for a plugin. JS is NOT evaluated here — it is
+  /// loaded lazily on the first search/getHome/getDetails/loadStreams call.
+  /// Sub-providers sharing the same JS file reuse one shared read Future so the
+  /// file is only read from disk once regardless of how many sub-providers exist.
   Future<List<SkyStreamProvider>> _loadPlugin(ExtensionPlugin plugin) async {
     if (_engine == null || _storageService == null) return [];
     try {
       final path = await _storageService!.getPluginJsPath(plugin);
-      if (kDebugMode) debugPrint("ExtensionManager: Loading JS from: $path");
-      talker.debug("ExtensionManager: Loading JS from: $path");
+      if (kDebugMode) debugPrint("ExtensionManager: Registering lazy shells from: $path");
+      talker.debug("ExtensionManager: Registering lazy shells from: $path");
 
       if (!path.startsWith('assets/')) {
         if (!await File(path).exists()) {
@@ -208,15 +214,33 @@ class ExtensionManager extends _$ExtensionManager {
         }
       }
 
+      // One shared file-read Future per plugin package. All sub-providers call
+      // this closure; only the first call starts the read, the rest await it.
+      Future<String?> sharedScriptLoader() {
+        return _pluginScriptFutures.putIfAbsent(plugin.packageName, () async {
+          try {
+            if (path.startsWith('assets/')) {
+              return await rootBundle.loadString(path);
+            } else {
+              return await File(path).readAsString();
+            }
+          } catch (e) {
+            // Remove so a subsequent call can retry after a transient error.
+            _pluginScriptFutures.remove(plugin.packageName)?.ignore();
+            return null;
+          }
+        });
+      }
+
       final baseNamespace = plugin.packageName.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
 
-      // Fan-out: one JS file → multiple provider instances
+      // Fan-out: one JS file → multiple lazy provider shells
       if (plugin.providers != null && plugin.providers!.isNotEmpty) {
         final results = <SkyStreamProvider>[];
         for (final sub in plugin.providers!) {
           if (!_isSubProviderEnabled(plugin.packageName, sub.id)) continue;
           final subId = sub.id.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
-          final provider = JsBasedProvider(
+          results.add(JsBasedProvider(
             _engine!,
             path,
             packageName: '${plugin.packageName}::${sub.id}',
@@ -224,19 +248,20 @@ class ExtensionManager extends _$ExtensionManager {
             namespace: '${baseNamespace}__$subId',
             forcedName: sub.name,
             manifest: plugin.manifest,
-            // Static baseUrl takes priority; otherwise inject providerId so
-            // JS can resolve the URL dynamically (e.g. via Firebase).
             customBaseUrl: sub.baseUrl,
             providerId: sub.baseUrl == null ? sub.id : null,
-          );
-          await provider.waitForInit;
-          results.add(provider);
+            scriptLoader: sharedScriptLoader,
+          ));
         }
-        if (kDebugMode) debugPrint("ExtensionManager: Loaded ${results.length} sub-providers for ${plugin.packageName}");
+        if (kDebugMode) debugPrint("ExtensionManager: Registered ${results.length} lazy sub-providers for ${plugin.packageName}");
+        // Pre-compile bytecode for each sub-provider (no-ops if already fresh).
+        for (final p in results) {
+          if (p is JsBasedProvider) p.precompile().ignore();
+        }
         return results;
       }
 
-      // Single provider
+      // Single provider shell
       final settings = ref.read(settingsRepositoryProvider);
       final customBaseUrl = settings.getCustomBaseUrl(plugin.packageName);
       final provider = JsBasedProvider(
@@ -246,16 +271,18 @@ class ExtensionManager extends _$ExtensionManager {
         namespace: baseNamespace,
         manifest: plugin.manifest,
         customBaseUrl: customBaseUrl,
+        scriptLoader: sharedScriptLoader,
       );
-      await provider.waitForInit;
       if (kDebugMode) {
-        debugPrint("ExtensionManager: Init complete for ${plugin.packageName}");
-        talker.debug("ExtensionManager: Init complete for ${plugin.packageName}");
+        debugPrint("ExtensionManager: Registered lazy shell for ${plugin.packageName}");
+        talker.debug("ExtensionManager: Registered lazy shell for ${plugin.packageName}");
       }
+      // Pre-compile bytecode (no-op if already fresh).
+      provider.precompile().ignore();
       return [provider];
     } catch (e) {
-      if (kDebugMode) debugPrint("Failed to load plugin ${plugin.name}: $e");
-      talker.error("Failed to load plugin ${plugin.name}: $e");
+      if (kDebugMode) debugPrint("Failed to register plugin ${plugin.name}: $e");
+      talker.error("Failed to register plugin ${plugin.name}: $e");
       return [];
     }
   }

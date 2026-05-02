@@ -16,6 +16,11 @@ abstract class SkyStreamProvider {
   bool get hasSearch => true;
   bool get isDebug => packageName.endsWith('.debug');
 
+  /// Cancel any pending JS eval for this provider so the queue isn't blocked
+  /// by a stale IIFE load after the triggering search was abandoned.
+  /// The provider resets itself so the next search retries cleanly.
+  void cancelInit() {}
+
   // Key methods providers must implement
   Future<List<MultimediaItem>> search(String query, {CancelToken? cancelToken});
   // Returns categorized content (Section Name -> Items)

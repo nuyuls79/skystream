@@ -21,6 +21,12 @@ import '../../network/dio_client_provider.dart';
 import 'package:html/parser.dart' as html_parser;
 import 'package:html/dom.dart' as html_dom;
 
+/// Thrown when a queued JS eval is removed by [JsEngineService.cancelPendingForTag].
+/// Caught by [JsBasedProvider._init] to reset state so the next search retries.
+class JsEvalCancelledException implements Exception {
+  const JsEvalCancelledException();
+}
+
 class JsPluginException implements Exception {
   final String code;
   final String message;
@@ -82,7 +88,7 @@ class JsEngineService {
     // Defer polyfill injection to avoid blocking the UI thread
     Future.microtask(() async {
       _initPolyfills();
-      _startPump();
+      _startPump(fast: false); // idle until first invokeAsync
     });
   }
 
@@ -106,27 +112,112 @@ class JsEngineService {
     }
   }
 
-  void _startPump() {
-    // Only create the pump once. It runs continuously at ~60Hz and drains
-    // up to 64 pending QuickJS jobs per tick. This is fast enough to keep
-    // promise chains flowing without starving the Dart event loop.
-    if (_centralPump != null) return;
-    _centralPump = Timer.periodic(const Duration(milliseconds: 16), (_) {
-      // Drain the QuickJS job queue — a single executePendingJob() only
-      // processes ONE microtask.  When dozens of HTTP callbacks resolve
-      // concurrently we need to flush them all in the same tick.
-      for (int i = 0; i < 64; i++) {
+  /// Starts (or switches) the QuickJS job-drain pump.
+  ///
+  /// [fast] = true  → 60 Hz, drains 8 jobs/tick   (active search / plugin load)
+  /// [fast] = false → 1 Hz,  drains 1 job/tick    (idle — keeps stale timers alive)
+  ///
+  /// 8 jobs/tick caps the worst-case blocking per frame at ~8 × single-job-time.
+  /// 64 was too high: if any job was expensive (large Promise chain, heavy JS
+  /// computation) the timer callback would block the UI thread for hundreds of ms.
+  void _startPump({bool fast = false}) {
+    _centralPump?.cancel();
+    if (fast) {
+      _centralPump = Timer.periodic(const Duration(milliseconds: 16), (_) {
+        for (int i = 0; i < 8; i++) {
+          _runtime.executePendingJob();
+        }
+      });
+    } else {
+      _centralPump = Timer.periodic(const Duration(seconds: 1), (_) {
         _runtime.executePendingJob();
-      }
-    });
+      });
+    }
   }
 
   void _incrementAsync() {
     _activeAsyncCount++;
+    if (_activeAsyncCount == 1) _startPump(fast: true);
   }
 
   void _decrementAsync() {
     _activeAsyncCount--;
+    if (_activeAsyncCount == 0) _startPump(fast: false);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Eval queue — serializes all _runtime.evaluate() calls through the event
+  // loop so no single turn blocks the UI thread for hundreds of milliseconds.
+  //
+  // Three entry types:
+  //   _scheduleEval  — fire-and-forget (HTTP callbacks, timers).  completer=null, tag=null.
+  //   _enqueueEval   — awaitable (loadScript).  completer captures errors.
+  //   _enqueueBytes  — awaitable (loadBytes).   completer captures errors.
+  //
+  // Payload is either a String (text eval) or Uint8List (bytecode eval).
+  // Tag is the provider packageName — used by cancelPendingForTag().
+  // ---------------------------------------------------------------------------
+  final _evalQueue = <(Object payload, Completer<void>? completer, String? tag)>[];
+  bool _evalDraining = false;
+
+  void _scheduleEval(String script) {
+    _evalQueue.add((script, null, null));
+    _kickDrain();
+  }
+
+  Future<void> _enqueueEval(String script, {String? tag}) {
+    final completer = Completer<void>();
+    _evalQueue.add((script, completer, tag));
+    _kickDrain();
+    return completer.future;
+  }
+
+  Future<void> _enqueueBytes(Uint8List bytecode, {String? tag}) {
+    final completer = Completer<void>();
+    _evalQueue.add((bytecode, completer, tag));
+    _kickDrain();
+    return completer.future;
+  }
+
+  /// Remove all queued entries for [tag] and complete their completers with
+  /// [JsEvalCancelledException] so the awaiting provider can reset and retry.
+  void cancelPendingForTag(String tag) {
+    final cancelled = _evalQueue.where((e) => e.$3 == tag).toList();
+    _evalQueue.removeWhere((e) => e.$3 == tag);
+    for (final entry in cancelled) {
+      entry.$2?.completeError(const JsEvalCancelledException());
+    }
+  }
+
+  // Always defers the drain to the next event-loop turn. This means no
+  // _runtime.evaluate() ever runs synchronously inside an HTTP callback or
+  // a loadScript call, so the UI thread stays free during those handlers.
+  void _kickDrain() {
+    if (!_evalDraining) {
+      _evalDraining = true;
+      Future.delayed(Duration.zero, _drainEvals);
+    }
+  }
+
+  void _drainEvals() {
+    if (_evalQueue.isEmpty) {
+      _evalDraining = false;
+      return;
+    }
+    final (payload, completer, _) = _evalQueue.removeAt(0);
+    final res = payload is Uint8List
+        ? _runtime.evalBytes(payload)
+        : _runtime.evaluate(payload as String);
+    if (completer != null) {
+      if (res.isError) {
+        completer.completeError(Exception("JS Eval Error: ${res.stringResult}"));
+      } else {
+        completer.complete();
+      }
+    }
+    // Yield one full event-loop turn before the next eval so frame callbacks
+    // and timer handlers get a chance to run between heavy script loads.
+    Future.delayed(Duration.zero, _drainEvals);
   }
 
   void _initPolyfills() {
@@ -169,7 +260,7 @@ class JsEngineService {
         final delay = data['delay'] ?? 0;
 
         Future.delayed(Duration(milliseconds: delay), () {
-          _runtime.evaluate(
+          _scheduleEval(
             "if (globalThis.timeout_registry['$id']) { globalThis.timeout_registry['$id'](); }",
           );
         });
@@ -227,15 +318,11 @@ class JsEngineService {
             final String? callbackId = data['id'];
             if (callbackId != null) {
               final String jsonResult = jsonEncode(result);
-              // Defer JS resumption by one event-loop turn so Flutter can
-              // process pending frame work before QuickJS continues. Without
-              // this, simultaneous HTTP responses all evaluate synchronously
-              // in the same turn, causing multi-frame jank on mobile.
-              Future.delayed(Duration.zero, () {
-                _runtime.evaluate(
-                  "_resolveDartAsync('$callbackId', $jsonResult, false)",
-                );
-              });
+              // Queue the eval so concurrent HTTP responses are serialized —
+              // one eval per event-loop turn, preventing multi-frame jank.
+              _scheduleEval(
+                "_resolveDartAsync('$callbackId', $jsonResult, false)",
+              );
             }
           })
           .catchError((Object e) {
@@ -244,11 +331,9 @@ class JsEngineService {
                 : jsonDecode(args.toString());
             final String? callbackId = data['id'];
             if (callbackId != null) {
-              Future.delayed(Duration.zero, () {
-                _runtime.evaluate(
-                  "_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)",
-                );
-              });
+              _scheduleEval(
+                "_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)",
+              );
             }
           });
       return null;
@@ -265,7 +350,7 @@ class JsEngineService {
             : jsonDecode(args.toString());
         final String? callbackId = data['id'];
         if (callbackId != null) {
-          _runtime.evaluate(
+          _scheduleEval(
             "_resolveDartAsync('$callbackId', ${jsonEncode(value)}, false)",
           );
         }
@@ -330,8 +415,7 @@ class JsEngineService {
         if (callbackId != null) {
           compute(_parseHtml, html ?? "")
               .then((doc) {
-                final String id =
-                    "doc_${DateTime.now().microsecondsSinceEpoch}";
+                final String id = "doc_${_callbackCounter++}";
 
                 if (_domRegistry.length > 100) {
                   final keys = _domRegistry.keys.toList();
@@ -342,19 +426,19 @@ class JsEngineService {
                 }
 
                 _domRegistry[id] = doc;
-                _runtime.evaluate(
+                _scheduleEval(
                   "_resolveDartAsync('$callbackId', ${jsonEncode(id)}, false)",
                 );
               })
               .catchError((Object e) {
-                _runtime.evaluate(
+                _scheduleEval(
                   "_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)",
                 );
               });
           return null;
         } else {
           // Synchronous fallback (deprecated, but kept for extreme safety if id is missing)
-          final String id = "doc_${DateTime.now().microsecondsSinceEpoch}";
+          final String id = "doc_${_callbackCounter++}";
           final doc = html_parser.parse(html ?? "");
           _domRegistry[id] = doc;
           return id;
@@ -563,13 +647,13 @@ class JsEngineService {
       compute(_parseAndExtract, _ParseAndExtractParams(html, extractionMap))
           .then((result) {
         if (callbackId != null) {
-          _runtime.evaluate(
+          _scheduleEval(
             "_resolveDartAsync('$callbackId', ${jsonEncode(result)}, false)",
           );
         }
       }).catchError((Object e) {
         if (callbackId != null) {
-          _runtime.evaluate(
+          _scheduleEval(
             "_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)",
           );
         }
@@ -1217,12 +1301,9 @@ class JsEngineService {
     }
   }
 
-  Future<void> loadScript(String script) async {
-    final res = _runtime.evaluate(script);
-    if (res.isError) {
-      throw Exception("JS Load Error: ${res.stringResult}");
-    }
-  }
+  Future<void> loadScript(String script, {String? tag}) => _enqueueEval(script, tag: tag);
+
+  Future<void> loadBytes(Uint8List bytecode, {String? tag}) => _enqueueBytes(bytecode, tag: tag);
 
   Future<dynamic> invokeAsync(
     String functionName, [

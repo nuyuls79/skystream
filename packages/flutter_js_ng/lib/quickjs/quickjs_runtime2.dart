@@ -225,6 +225,30 @@ class QuickJsRuntime2 extends JavascriptRuntime {
   }
 
   @override
+  bool get supportsBytecode => true;
+
+  @override
+  Uint8List? compileToBytes(String script) {
+    _ensureEngine();
+    return jsCompileToBytes(_ctx!, script, '<compile>');
+  }
+
+  @override
+  JsEvalResult evalBytes(Uint8List bytecode) {
+    _ensureEngine();
+    final ctx = _ctx!;
+    final jsval = jsEvalBytes(ctx, bytecode);
+    if (jsIsException(jsval) != 0) {
+      jsFreeValue(ctx, jsval);
+      final JSError exception = _parseJSException(ctx);
+      return JsEvalResult(exception.toString(), exception, isError: true);
+    }
+    final result = _jsToDart(ctx, jsval);
+    jsFreeValue(ctx, jsval);
+    return JsEvalResult(result?.toString() ?? 'null', result);
+  }
+
+  @override
   JsEvalResult callFunction(Pointer<NativeType> fn, Pointer<NativeType> obj) {
     throw UnimplementedError();
   }

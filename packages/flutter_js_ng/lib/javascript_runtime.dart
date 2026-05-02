@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
-
 import 'package:flutter/foundation.dart';
 
 import 'js_eval_result.dart';
@@ -108,6 +107,17 @@ abstract class JavascriptRuntime {
 
   /// Trigger garbage collection. Only effective on QuickJS-based runtimes.
   void runGC() {}
+
+  /// Whether this runtime supports bytecode compile/eval.
+  /// True on QuickJS (Android/Windows/Linux), false on JavaScriptCore.
+  bool get supportsBytecode => false;
+
+  /// Compile [script] to bytecode. Returns null if unsupported or on error.
+  Uint8List? compileToBytes(String script) => null;
+
+  /// Execute bytecode previously produced by [compileToBytes].
+  JsEvalResult evalBytes(Uint8List bytecode) =>
+      throw UnsupportedError('Bytecode not supported on this runtime');
 
   void _setupConsoleLog() {
     evaluate("""

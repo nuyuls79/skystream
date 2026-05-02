@@ -7,6 +7,7 @@ import 'package:dio/dio.dart';
 import '../../domain/entity/multimedia_item.dart';
 import '../base_provider.dart';
 import '../engine/js_engine.dart';
+import '../engine/js_bytecode_compiler.dart';
 import '../../services/local_proxy_service.dart';
 import '../../logger/app_logger.dart';
 
@@ -51,9 +52,11 @@ class JsBasedProvider extends SkyStreamProvider {
   // Scopes JS getPreference/setPreference — sub-providers share parent's namespace
   final String _jsPackageName;
 
-  late Future<void> _initFuture;
-  final Map<String, dynamic>? _initialManifest;
+  Future<void>? _initFuture;
   final String? _customBaseUrl;
+  // Optional shared script loader injected by ExtensionManager to deduplicate
+  // file reads across sub-providers that share the same JS file.
+  final Future<String?> Function()? _scriptLoader;
 
   JsBasedProvider(
     this._jsEngine,
@@ -65,61 +68,60 @@ class JsBasedProvider extends SkyStreamProvider {
     Map<String, dynamic>? manifest,
     String? customBaseUrl,
     String? providerId,
+    Future<String?> Function()? scriptLoader,
   }) : _packageName = packageName,
        _jsPackageName = jsPackageName ?? packageName,
        _namespace = namespace,
        _forcedName = forcedName,
-       _initialManifest = manifest,
        _customBaseUrl = customBaseUrl,
-       _providerId = providerId {
-    _initFuture = _init();
+       _providerId = providerId,
+       _scriptLoader = scriptLoader {
+    // Populate manifest immediately so name/version/languages/supportedTypes
+    // are available before lazy JS evaluation runs.
+    if (manifest != null && manifest.isNotEmpty) {
+      _manifest = Map<String, dynamic>.from(manifest);
+      if (customBaseUrl != null && customBaseUrl.isNotEmpty) {
+        _manifest['baseUrl'] = customBaseUrl;
+      }
+    }
   }
 
-  Future<void> get waitForInit => _initFuture;
+  Future<void> _ensureReady() {
+    _initFuture ??= _init();
+    return _initFuture!;
+  }
+
+  Future<void> get waitForInit => _ensureReady();
+
+  @override
+  void cancelInit() {
+    _jsEngine.cancelPendingForTag(_packageName);
+    // _init() detects JsEvalCancelledException and resets _initFuture itself.
+  }
 
   Map<String, dynamic> _manifest = {};
   String? _error;
 
-  Future<void> _init() async {
-    String? script;
-    try {
-      if (_scriptPath.startsWith('assets/')) {
-        script = await rootBundle.loadString(_scriptPath);
-      } else {
-        final file = File(_scriptPath);
-        if (await file.exists()) {
-          script = await file.readAsString();
-        }
-      }
-    } catch (e) {
-      if (kDebugMode) debugPrint("Error reading JS script ($_scriptPath): $e");
-      _error = "Read: $e";
-    }
+  // Per-sub-provider bytecode path. Only valid for file-based (non-asset) plugins.
+  String? get _qbcPath {
+    if (_scriptPath.startsWith('assets/')) return null;
+    final dir = _scriptPath.substring(0, _scriptPath.lastIndexOf('/') + 1);
+    final safeId = (_namespace ?? _packageName).replaceAll(RegExp(r'[^a-zA-Z0-9_]'), '_');
+    return '$dir$safeId.qbc';
+  }
 
-    if (script != null) {
-      // 1. Ensure manifest is populated BEFORE evaluation
-      if (_initialManifest != null && _initialManifest.isNotEmpty) {
-        _manifest = Map<String, dynamic>.from(_initialManifest);
-        if (_customBaseUrl != null && _customBaseUrl.isNotEmpty) {
-          _manifest['baseUrl'] = _customBaseUrl;
-        }
-      }
-
-      final manifestJson = jsonEncode(_manifest);
-
-      // 2. Enforce IIFE wrapping for namespaced execution (Plugin v2 Standard)
-      if (_namespace != null) {
-        final providerIdLine = _providerId != null
-            ? "manifest.providerId = ${jsonEncode(_providerId)};"
-            : "";
-        script =
-            """
+  // Wraps the raw plugin source in a namespaced IIFE with manifest + storage API.
+  String _buildIife(String rawScript) {
+    if (_namespace == null) return rawScript;
+    final manifestJson = jsonEncode(_manifest);
+    final providerIdLine = _providerId != null
+        ? "manifest.providerId = ${jsonEncode(_providerId)};"
+        : "";
+    return """
           (function() {
-              // Standard v2: Every plugin strictly uses the injected manifest.
               const manifest = $manifestJson;
               $providerIdLine
 
-              // Namespaced Storage API Parity
               const getPreference = (key) => {
                   return sendMessage('get_preference', JSON.stringify({ packageName: '$_jsPackageName', key: key }));
               };
@@ -128,13 +130,12 @@ class JsBasedProvider extends SkyStreamProvider {
                   return sendMessage('set_preference', JSON.stringify({ packageName: '$_jsPackageName', key: key, value: value }));
               };
 
-              // Export to global scope if needed (backward compatibility)
               globalThis.getPreference = getPreference;
               globalThis.setPreference = setPreference;
 
               var exports = (function() {
-                  $script
-                  
+                  $rawScript
+
                   return {
                       getHome: (typeof getHome !== 'undefined') ? getHome : (typeof globalThis.getHome !== 'undefined' ? globalThis.getHome : undefined),
                       search: (typeof search !== 'undefined') ? search : (typeof globalThis.search !== 'undefined' ? globalThis.search : undefined),
@@ -144,35 +145,86 @@ class JsBasedProvider extends SkyStreamProvider {
               })();
               globalThis['$_namespace'] = exports;
 
-              // Final Cleanup: If the plugin polluted globalThis (old style), we clean it up 
-              // after capturing it into the namespace.
               if (globalThis.getHome) delete globalThis.getHome;
               if (globalThis.search) delete globalThis.search;
               if (globalThis.load) delete globalThis.load;
               if (globalThis.loadStreams) delete globalThis.loadStreams;
           })();
           """;
+  }
+
+  Future<void> _init() async {
+    String? rawScript;
+    try {
+      if (_scriptLoader != null) {
+        rawScript = await _scriptLoader();
+      } else if (_scriptPath.startsWith('assets/')) {
+        rawScript = await rootBundle.loadString(_scriptPath);
+      } else {
+        final file = File(_scriptPath);
+        if (await file.exists()) rawScript = await file.readAsString();
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint("Error reading JS script ($_scriptPath): $e");
+      _error = "Read: $e";
+    }
+
+    if (rawScript == null) {
+      _error = "Not found";
+      return;
+    }
+
+    final script = _buildIife(rawScript);
+    final qbc = _qbcPath;
+
+    try {
+      // Fast path: load pre-compiled bytecode when available and fresh.
+      if (qbc != null && !JsBytecodeCompiler.isStale(_scriptPath, qbc)) {
+        final bytes = await File(qbc).readAsBytes();
+        await _jsEngine.loadBytes(bytes, tag: _packageName);
+        if (kDebugMode) talker.debug("JsBasedProvider: Loaded bytecode for $_packageName");
+        return;
       }
 
-      try {
-        await _jsEngine.loadScript(script);
-        if (kDebugMode) {
-          debugPrint(
-            "JsBasedProvider: Loaded namespaced script for $_packageName",
-          );
-          talker.debug("JsBasedProvider: Loaded namespaced script for $_packageName");
-        }
-      } catch (e) {
-        _error = "Eval: $e";
-        if (kDebugMode) {
-          debugPrint(
-            "JsBasedProvider: CRITICAL - Eval failed for $_packageName: $e",
-          );
-        }
+      // Slow path: text eval, then compile bytecode in the background.
+      await _jsEngine.loadScript(script, tag: _packageName);
+      if (kDebugMode) talker.debug("JsBasedProvider: Loaded script for $_packageName");
+
+      if (qbc != null) {
+        // Fire-and-forget: compile bytecode for next launch.
+        JsBytecodeCompiler.compile(script, qbc).ignore();
       }
-    } else {
-      _error = "Not found";
+    } on JsEvalCancelledException {
+      // Search was cancelled before this IIFE ran. Reset so the next search
+      // triggers a fresh _init() instead of replaying the cancelled future.
+      _initFuture = null;
+      _error = null;
+      return;
+    } catch (e) {
+      _error = "Eval: $e";
+      if (kDebugMode) debugPrint("JsBasedProvider: CRITICAL - Eval failed for $_packageName: $e");
     }
+  }
+
+  /// Called by ExtensionManager at install/update time to pre-compile bytecode.
+  /// No-ops if bytecode is already fresh. Returns true if bytecode was written.
+  Future<bool> precompile() async {
+    final qbc = _qbcPath;
+    if (qbc == null) return false;
+    if (!JsBytecodeCompiler.isStale(_scriptPath, qbc)) return false;
+    String? rawScript;
+    try {
+      if (_scriptLoader != null) {
+        rawScript = await _scriptLoader();
+      } else {
+        final file = File(_scriptPath);
+        if (await file.exists()) rawScript = await file.readAsString();
+      }
+    } catch (_) {
+      return false;
+    }
+    if (rawScript == null) return false;
+    return JsBytecodeCompiler.compile(_buildIife(rawScript), qbc);
   }
 
   String _fn(String name) => _namespace != null ? '$_namespace.$name' : name;
@@ -259,7 +311,7 @@ class JsBasedProvider extends SkyStreamProvider {
 
   @override
   Future<Map<String, List<MultimediaItem>>> getHome() async {
-    await _initFuture;
+    await _ensureReady();
     if (_error != null) throw JsPluginException("INIT_ERROR", _error!);
     try {
       final result = await _jsEngine.invokeAsync(_fn('getHome'));
@@ -281,7 +333,7 @@ class JsBasedProvider extends SkyStreamProvider {
 
   @override
   Future<List<MultimediaItem>> search(String query, {CancelToken? cancelToken}) async {
-    await _initFuture;
+    await _ensureReady();
     if (_error != null) throw JsPluginException("INIT_ERROR", _error!);
     try {
       final result = await _jsEngine.invokeAsync(_fn('search'), [query], cancelToken);
@@ -302,7 +354,7 @@ class JsBasedProvider extends SkyStreamProvider {
 
   @override
   Future<MultimediaItem> getDetails(String url) async {
-    await _initFuture;
+    await _ensureReady();
     if (_error != null) throw JsPluginException("INIT_ERROR", _error!);
     try {
       final result = await _jsEngine.invokeAsync(_fn('load'), [url]);
@@ -327,7 +379,7 @@ class JsBasedProvider extends SkyStreamProvider {
 
   @override
   Future<List<StreamResult>> loadStreams(String url) async {
-    await _initFuture;
+    await _ensureReady();
     if (_error != null) throw JsPluginException("INIT_ERROR", _error!);
     await LocalProxyService.instance.startServer();
 

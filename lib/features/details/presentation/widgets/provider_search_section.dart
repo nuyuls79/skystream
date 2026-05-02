@@ -27,7 +27,7 @@ Stream<SearchAggregateState> providerSearch(Ref ref, String query) {
   var cancelled = false;
   ref.onDispose(() => cancelled = true);
 
-  return searchAllProviders(ref, query, manager, isCancelled: () => cancelled);
+  return searchAllProviders(ref, query, manager, filter: SearchFilter.content, isCancelled: () => cancelled);
 }
 
 class ProviderSearchSection extends ConsumerStatefulWidget {

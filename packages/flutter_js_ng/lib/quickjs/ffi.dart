@@ -8,6 +8,7 @@
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 extension ListFirstWhere<T> on Iterable<T> {
@@ -1061,3 +1062,94 @@ final void Function(
               Pointer<JSPropertyEnum>,
             )>>('jsFree')
     .asFunction();
+
+// ---------------------------------------------------------------------------
+// Bytecode compile / eval
+// ---------------------------------------------------------------------------
+
+/// uint8_t *jsCompileToBytes(JSContext *ctx, const char *input, size_t input_len,
+///                           const char *filename, size_t *out_len)
+final Pointer<Uint8> Function(
+  Pointer<JSContext> ctx,
+  Pointer<Utf8> input,
+  int inputLen,
+  Pointer<Utf8> filename,
+  Pointer<IntPtr> outLen,
+) _jsCompileToBytes = _qjsLib
+    .lookup<
+        NativeFunction<
+            Pointer<Uint8> Function(
+              Pointer<JSContext>,
+              Pointer<Utf8>,
+              IntPtr,
+              Pointer<Utf8>,
+              Pointer<IntPtr>,
+            )>>('jsCompileToBytes')
+    .asFunction();
+
+/// Compile [script] to QuickJS bytecode. Returns null on compile error.
+Uint8List? jsCompileToBytes(
+  Pointer<JSContext> ctx,
+  String script,
+  String filename,
+) {
+  final utf8input = script.toNativeUtf8();
+  final utf8filename = filename.toNativeUtf8();
+  final outLen = calloc<IntPtr>();
+  try {
+    final buf = _jsCompileToBytes(ctx, utf8input, utf8input.length, utf8filename, outLen);
+    if (buf.address == 0) return null;
+    final len = outLen.value;
+    final result = Uint8List.fromList(buf.asTypedList(len));
+    jsFreeBytecode(ctx, buf);
+    return result;
+  } finally {
+    malloc.free(utf8input);
+    malloc.free(utf8filename);
+    calloc.free(outLen);
+  }
+}
+
+/// void jsFreeBytecode(JSContext *ctx, uint8_t *buf)
+final void Function(
+  Pointer<JSContext> ctx,
+  Pointer<Uint8> buf,
+) jsFreeBytecode = _qjsLib
+    .lookup<
+        NativeFunction<
+            Void Function(
+              Pointer<JSContext>,
+              Pointer<Uint8>,
+            )>>('jsFreeBytecode')
+    .asFunction();
+
+/// JSValue *jsEvalBytes(JSContext *ctx, const uint8_t *buf, size_t buf_len)
+final Pointer<JSValue> Function(
+  Pointer<JSContext> ctx,
+  Pointer<Uint8> buf,
+  int bufLen,
+) _jsEvalBytes = _qjsLib
+    .lookup<
+        NativeFunction<
+            Pointer<JSValue> Function(
+              Pointer<JSContext>,
+              Pointer<Uint8>,
+              IntPtr,
+            )>>('jsEvalBytes')
+    .asFunction();
+
+/// Evaluate bytecode previously produced by [jsCompileToBytes].
+Pointer<JSValue> jsEvalBytes(
+  Pointer<JSContext> ctx,
+  Uint8List bytecode,
+) {
+  final buf = calloc<Uint8>(bytecode.length);
+  try {
+    buf.asTypedList(bytecode.length).setAll(0, bytecode);
+    final result = _jsEvalBytes(ctx, buf, bytecode.length);
+    runtimeOpaques[jsGetRuntime(ctx)]?._port.sendPort.send(#eval);
+    return result;
+  } finally {
+    calloc.free(buf);
+  }
+}

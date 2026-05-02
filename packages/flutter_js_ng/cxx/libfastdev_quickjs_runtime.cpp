@@ -516,6 +516,41 @@ extern "C"
         return ret;
     }
 
+    // Compile a script to QuickJS bytecode without executing it.
+    // Returns the bytecode buffer (caller must free with jsFreeBytecode) and
+    // writes the byte count to *out_len. Returns NULL on compile error.
+    DLLEXPORT uint8_t *jsCompileToBytes(JSContext *ctx, const char *input, size_t input_len, const char *filename, size_t *out_len)
+    {
+        JS_UpdateStackTop(JS_GetRuntime(ctx));
+        JSValue func_val = JS_Eval(ctx, input, input_len, filename, JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(func_val)) {
+            JS_FreeValue(ctx, func_val);
+            return NULL;
+        }
+        uint8_t *buf = JS_WriteObject(ctx, out_len, func_val, JS_WRITE_OBJ_BYTECODE);
+        JS_FreeValue(ctx, func_val);
+        return buf;
+    }
+
+    // Free a bytecode buffer returned by jsCompileToBytes.
+    DLLEXPORT void jsFreeBytecode(JSContext *ctx, uint8_t *buf)
+    {
+        js_free(ctx, buf);
+    }
+
+    // Deserialize and execute bytecode previously produced by jsCompileToBytes.
+    DLLEXPORT JSValue *jsEvalBytes(JSContext *ctx, const uint8_t *buf, size_t buf_len)
+    {
+        JS_UpdateStackTop(JS_GetRuntime(ctx));
+        JSValue obj = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
+        if (JS_IsException(obj)) {
+            return new JSValue(obj);
+        }
+        // JS_EvalFunction takes ownership of obj — no separate free needed.
+        JSValue ret = JS_EvalFunction(ctx, obj);
+        return new JSValue(ret);
+    }
+
     DLLEXPORT int32_t jsValueGetTag(JSValue *val)
     {
         return JS_VALUE_GET_TAG(*val);

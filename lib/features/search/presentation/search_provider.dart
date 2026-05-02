@@ -10,6 +10,8 @@ import '../../explore/data/explore_tmdb_provider.dart';
 
 part 'search_provider.g.dart';
 
+enum SearchFilter { content, live }
+
 class ProviderSearchResult {
   final String providerId;
   final String providerName;
@@ -65,9 +67,16 @@ Stream<SearchAggregateState> searchAllProviders(
   Ref ref,
   String query,
   ExtensionManager manager, {
+  required SearchFilter filter,
   required bool Function() isCancelled,
 }) async* {
-  final providers = manager.getAllProviders();
+  final allProviders = manager.getAllProviders();
+  final providers = allProviders.where((p) {
+    final isLiveOnly =
+        p.supportedTypes.isNotEmpty &&
+        p.supportedTypes.every((t) => t == ProviderType.livestream);
+    return filter == SearchFilter.live ? isLiveOnly : !isLiveOnly;
+  }).toList();
   debugPrint(
     '[SEARCH DBG] searchAllProviders called: query="$query", providers=${providers.length}, cancelled=${isCancelled()}',
   );
@@ -93,9 +102,10 @@ Stream<SearchAggregateState> searchAllProviders(
       if (io.Platform.isMacOS || io.Platform.isWindows || io.Platform.isLinux) {
         maxSlots = 32;
       } else {
-        // Mobile: keep concurrency at 5. Higher values (8) cause large
-        // simultaneous HTTP-callback bursts that compound WebView/JS stutter.
-        maxSlots = (cores).clamp(3, 6);
+        // Mobile: eval burst queue serializes HTTP callbacks, but CF bypass
+        // WebView GPU init is still expensive — cap at 8 to avoid triggering
+        // too many concurrent CF solves while the spawn semaphore queues them.
+        maxSlots = (cores).clamp(4, 8);
       }
     } catch (_) {}
     return maxSlots;
@@ -120,6 +130,7 @@ Stream<SearchAggregateState> searchAllProviders(
     });
   final queue = List<SkyStreamProvider>.from(sortedProviders);
   final List<CancelToken> activeTokens = [];
+  final List<SkyStreamProvider> activeProviders = [];
   bool isCompleted = false;
 
   Timer? throttleTimer;
@@ -181,6 +192,11 @@ Stream<SearchAggregateState> searchAllProviders(
         if (!t.isCancelled) t.cancel('Search cancelled');
       }
       activeTokens.clear();
+      // Drop any IIFE evals still waiting in the JS queue for active providers.
+      for (final p in activeProviders) {
+        p.cancelInit();
+      }
+      activeProviders.clear();
       return;
     }
 
@@ -190,6 +206,7 @@ Stream<SearchAggregateState> searchAllProviders(
       activeJobs++;
       final token = CancelToken();
       activeTokens.add(token);
+      activeProviders.add(provider);
 
       Future(() async {
         if (isCancelled() || token.isCancelled) {
@@ -275,6 +292,7 @@ Stream<SearchAggregateState> searchAllProviders(
         } finally {
           activeJobs--;
           activeTokens.remove(token);
+          activeProviders.remove(provider);
 
           final isLast = activeJobs == 0 && queue.isEmpty;
           debugPrint(
@@ -317,8 +335,17 @@ class SearchQuery extends _$SearchQuery {
 }
 
 @Riverpod(keepAlive: true)
+class SearchFilterNotifier extends _$SearchFilterNotifier {
+  @override
+  SearchFilter build() => SearchFilter.content;
+
+  void set(SearchFilter filter) => state = filter;
+}
+
+@Riverpod(keepAlive: true)
 Stream<SearchAggregateState> searchResults(Ref ref) {
   final query = ref.watch(searchQueryProvider);
+  final filter = ref.watch(searchFilterProvider);
   final manager = ref.read(extensionManagerProvider.notifier);
 
   debugPrint('[SEARCH DBG] searchResults PROVIDER BUILT — query="$query"');
@@ -329,7 +356,7 @@ Stream<SearchAggregateState> searchResults(Ref ref) {
     cancelled = true;
   });
 
-  return searchAllProviders(ref, query, manager, isCancelled: () => cancelled);
+  return searchAllProviders(ref, query, manager, filter: filter, isCancelled: () => cancelled);
 }
 
 class SearchSuggestionState {

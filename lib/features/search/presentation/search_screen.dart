@@ -165,9 +165,13 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
           ),
         ),
       ),
-      body: showSuggestions
-          ? _buildSuggestionsView(context, suggestionState)
-          : searchResultsAsync.when(
+      body: Column(
+        children: [
+          _buildFilterRow(context),
+          Expanded(
+            child: showSuggestions
+                ? _buildSuggestionsView(context, suggestionState)
+                : searchResultsAsync.when(
         data: (state) {
           final allResults = state.results.expand((e) => e.results).toList();
 
@@ -200,6 +204,33 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
         },
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (err, stack) => Center(child: Text(l10n.errorPrefix(err.toString()))),
+      ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFilterRow(BuildContext context) {
+    final filter = ref.watch(searchFilterProvider);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      child: Row(
+        children: [
+          ChoiceChip(
+            label: const Text('Content'),
+            selected: filter == SearchFilter.content,
+            onSelected: (_) =>
+                ref.read(searchFilterProvider.notifier).set(SearchFilter.content),
+          ),
+          const SizedBox(width: 8),
+          ChoiceChip(
+            label: const Text('Live TV'),
+            selected: filter == SearchFilter.live,
+            onSelected: (_) =>
+                ref.read(searchFilterProvider.notifier).set(SearchFilter.live),
+          ),
+        ],
       ),
     );
   }
