@@ -4,11 +4,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:media_kit/media_kit.dart';
+
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
-import 'package:video_view/video_view.dart' as vv;
+
 import '../../../../l10n/generated/app_localizations.dart';
 import '../player_controller.dart';
 import '../../../../core/services/notification_service.dart';
@@ -30,8 +30,6 @@ import '../player_platform_service.dart';
 import '../player_gesture_handler.dart';
 
 class SkyStreamPlayerControls extends ConsumerStatefulWidget {
-  final Player player;
-  final vv.VideoController? videoViewController;
   final String? title;
   final String? subtitle;
   final VoidCallback? onBackPointer;
@@ -47,8 +45,6 @@ class SkyStreamPlayerControls extends ConsumerStatefulWidget {
 
   const SkyStreamPlayerControls({
     super.key,
-    required this.player,
-    this.videoViewController,
     this.title,
     this.subtitle,
     this.onBackPointer,
@@ -115,51 +111,55 @@ class SkyStreamPlayerControlsState
     _isIpad = Platform.isIOS && (deviceProfile?.isTablet ?? false);
 
     _platformService = PlayerPlatformService();
-    ref.read(playerGestureHandlerProvider.notifier).init(
-      getSettings: () async => await ref.read(playerSettingsProvider.future),
-      isTv: _isTv,
-      isDesktop: Platform.isMacOS || Platform.isWindows || Platform.isLinux,
-      getDuration: () => _duration,
-      getPosition: () => _position,
-      canSeek: () => ref.read(playerControllerProvider).canSeek,
-      getMaxVolumeLevel:
-          () =>
-              ref.read(playerControllerProvider).supportsVolumeBoost ? 2.0 : 1.0,
-      onInteraction: () {
-        if (!_isVisible) {
-          setState(() => _isVisible = true);
-          widget.onVisibilityChanged?.call(true);
-        }
-        _startHideTimer();
-      },
-      onHideControls: () {
-        _cancelHideTimer();
-        if (_isVisible && mounted) {
-          setState(() => _isVisible = false);
-          widget.onVisibilityChanged?.call(false);
-        }
-      },
-      onSeekRelative: (amount) async {
-        _seekRelative(amount);
-      },
-      onSeekTo: (position) =>
-          ref.read(playerControllerProvider.notifier).seekTo(position),
-      getVolumeLevel: () =>
-          ref.read(playerControllerProvider.notifier).getVolumeLevel(),
-      setVolumeLevel: (value) =>
-          ref.read(playerControllerProvider.notifier).setVolumeLevel(value),
-      onVolumeChange: (step) =>
-          ref.read(playerControllerProvider.notifier).changeVolume(step),
-      toggleMuteLevel: () =>
-          ref.read(playerControllerProvider.notifier).toggleMute(),
-      onDoubleTapAnimationStart: (isLeft, tapPos, seconds) {
-        setState(() {
-          _tapPosition = tapPos;
-          _isSeekingLeft = isLeft;
-        });
-        _seekAnimController.forward(from: 0.0);
-      },
-    );
+    ref
+        .read(playerGestureHandlerProvider.notifier)
+        .init(
+          getSettings: () async =>
+              await ref.read(playerSettingsProvider.future),
+          isTv: _isTv,
+          isDesktop: Platform.isMacOS || Platform.isWindows || Platform.isLinux,
+          getDuration: () => _duration,
+          getPosition: () => _position,
+          canSeek: () => ref.read(playerControllerProvider).canSeek,
+          getMaxVolumeLevel: () =>
+              ref.read(playerControllerProvider).supportsVolumeBoost
+              ? 2.0
+              : 1.0,
+          onInteraction: () {
+            if (!_isVisible) {
+              setState(() => _isVisible = true);
+              widget.onVisibilityChanged?.call(true);
+            }
+            _startHideTimer();
+          },
+          onHideControls: () {
+            _cancelHideTimer();
+            if (_isVisible && mounted) {
+              setState(() => _isVisible = false);
+              widget.onVisibilityChanged?.call(false);
+            }
+          },
+          onSeekRelative: (amount) async {
+            _seekRelative(amount);
+          },
+          onSeekTo: (position) =>
+              ref.read(playerControllerProvider.notifier).seekTo(position),
+          getVolumeLevel: () =>
+              ref.read(playerControllerProvider.notifier).getVolumeLevel(),
+          setVolumeLevel: (value) =>
+              ref.read(playerControllerProvider.notifier).setVolumeLevel(value),
+          onVolumeChange: (step) =>
+              ref.read(playerControllerProvider.notifier).changeVolume(step),
+          toggleMuteLevel: () =>
+              ref.read(playerControllerProvider.notifier).toggleMute(),
+          onDoubleTapAnimationStart: (isLeft, tapPos, seconds) {
+            setState(() {
+              _tapPosition = tapPos;
+              _isSeekingLeft = isLeft;
+            });
+            _seekAnimController.forward(from: 0.0);
+          },
+        );
 
     _playFocusNode = FocusNode();
     try {
@@ -169,66 +169,20 @@ class SkyStreamPlayerControlsState
         debugPrint("VolumeUI Error: $e");
       }
     }
-    _isPlaying = widget.player.state.playing;
-    _position = widget.player.state.position;
-    _duration = widget.player.state.duration;
+    _isPlaying = false;
+    _position = Duration.zero;
+    _duration = Duration.zero;
 
     // OPTIMIZATION: Removed setState calls for position/buffering - now using StreamBuilder widgets
     // This reduces rebuilds from 60+/second to only when visibility/lock state changes
-    _subscriptions.addAll([
-      // Playing state: Only for timer/PiP sync, NOT for UI rebuilds (StreamBuilder handles that)
-      widget.player.stream.playing.listen((val) {
-        final oldPlaying = _isPlaying;
-        _isPlaying = val; // Update local cache
-        if (val) {
-          _startHideTimer();
-        } else {
-          _cancelHideTimer();
-        }
-
-        // REBUILD: If we transition to playing but were stuck in loading UI, trigger rebuild
-        if (mounted && val && !oldPlaying && _duration == Duration.zero) {
-          setState(() {});
-        }
-        // Sync PiP state with Android
-        if (Platform.isAndroid) {
-          const MethodChannel(
-            'dev.akash.skystream.player/pip',
-          ).invokeMethod('setPipState', {'isPlaying': val});
-        }
-      }),
-      // Position: No setState needed - StreamBuilder in PlayerProgressBar handles UI
-      widget.player.stream.position.listen((val) {
-        _position = val; // Update local cache for seek calculations
-      }),
-      // Duration: Only setState when transitioning from zero (to show controls)
-      widget.player.stream.duration.listen((val) {
-        final oldDuration = _duration;
-        _duration = val; // Update local cache
-        if (mounted && oldDuration == Duration.zero && val != Duration.zero) {
-          setState(() {
-            _isVisible = true;
-          });
-          _startHideTimer();
-        }
-      }),
-      widget.player.stream.width.listen((_) => _updateOrientation()),
-      widget.player.stream.height.listen((_) => _updateOrientation()),
-    ]);
+    // TODO: FVP — Subscribe to FVP player state/position/duration streams
+    // _subscriptions will be populated in Phase 2
 
     _seekAnimController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 600),
     );
     // No addListener needed — AnimatedBuilder wraps the seek widget directly
-
-    // Bridge video_view state into local cache so seek calculations and
-    // the loading guard stay correct when ExoPlayer is active.
-    widget.videoViewController?.position.addListener(_onVvPosition);
-    widget.videoViewController?.playbackState.addListener(_onVvPlaybackState);
-    widget.videoViewController?.mediaInfo.addListener(_onVvMediaInfo);
-    widget.videoViewController?.videoSize.addListener(_updateOrientation);
-    widget.videoViewController?.orientation.addListener(_updateOrientation);
 
     // PiP is phone/tablet-only — never register the handler on TV.
     if (Platform.isAndroid && !_isTv) {
@@ -284,13 +238,6 @@ class SkyStreamPlayerControlsState
 
   @override
   void dispose() {
-    widget.videoViewController?.position.removeListener(_onVvPosition);
-    widget.videoViewController?.playbackState.removeListener(
-      _onVvPlaybackState,
-    );
-    widget.videoViewController?.mediaInfo.removeListener(_onVvMediaInfo);
-    widget.videoViewController?.videoSize.removeListener(_updateOrientation);
-    widget.videoViewController?.orientation.removeListener(_updateOrientation);
     FocusManager.instance.removeListener(_onFocusChange);
     _playFocusNode.dispose();
     _backFocusNode.dispose();
@@ -323,27 +270,9 @@ class SkyStreamPlayerControlsState
   }
 
   void _updateOrientation() {
-    final useExo = ref.read(
-      playerControllerProvider.select((s) => s.useExoPlayer),
-    );
-    if (useExo && widget.videoViewController != null) {
-      final size = widget.videoViewController!.videoSize.value;
-      final orientation = widget.videoViewController!.orientation.value;
-
-      if (size.width > 0 && size.height > 0) {
-        // Swap dimensions if orientation is 90 or 270 degrees
-        final isLandscape = orientation == 1 || orientation == 3;
-        final w = isLandscape ? size.height : size.width;
-        final h = isLandscape ? size.width : size.height;
-
-        _platformService.updateOrientation(w.toInt(), h.toInt());
-      }
-    } else {
-      _platformService.updateOrientation(
-        widget.player.state.width,
-        widget.player.state.height,
-      );
-    }
+    final videoWidth = ref.read(playerControllerProvider).videoWidth;
+    final videoHeight = ref.read(playerControllerProvider).videoHeight;
+    _platformService.updateOrientation(videoWidth, videoHeight);
   }
 
   Future<void> _enterPip() async {
@@ -379,10 +308,9 @@ class SkyStreamPlayerControlsState
 
     if (widget.isLoading || _duration == Duration.zero) return;
     if (_tapPosition != null) {
-      ref.read(playerGestureHandlerProvider.notifier).handleDoubleTap(
-        _tapPosition!,
-        MediaQuery.sizeOf(context).width,
-      );
+      ref
+          .read(playerGestureHandlerProvider.notifier)
+          .handleDoubleTap(_tapPosition!, MediaQuery.sizeOf(context).width);
     }
   }
 
@@ -461,48 +389,6 @@ class SkyStreamPlayerControlsState
     }
   }
 
-  // --- video_view bridge listeners ---
-  void _onVvPosition() {
-    final ms = widget.videoViewController?.position.value ?? 0;
-    _position = Duration(milliseconds: ms);
-  }
-
-  void _onVvPlaybackState() {
-    final state = widget.videoViewController?.playbackState.value;
-    final playing = state == vv.VideoControllerPlaybackState.playing;
-    if (playing != _isPlaying) {
-      _isPlaying = playing;
-      if (playing) {
-        _startHideTimer();
-      } else {
-        _cancelHideTimer();
-      }
-    }
-  }
-
-  void _onVvMediaInfo() {
-    final info = widget.videoViewController?.mediaInfo.value;
-    final ms = info?.duration ?? 0;
-    final newDuration = Duration(milliseconds: ms);
-    final oldDuration = _duration;
-    _duration = newDuration;
-    // Show controls when media loads (same logic as media_kit duration listener)
-    if (mounted &&
-        oldDuration == Duration.zero &&
-        newDuration != Duration.zero) {
-      setState(() => _isVisible = true);
-      _startHideTimer();
-    }
-
-    if (widget.videoViewController != null) {
-      final size = widget.videoViewController!.videoSize.value;
-      if (size.width > 0 && size.height > 0) {
-        _updateOrientation();
-      }
-    }
-  }
-  // ------------------------------------
-
   void _togglePlay() {
     unawaited(ref.read(playerControllerProvider.notifier).togglePlayPause());
   }
@@ -559,13 +445,17 @@ class SkyStreamPlayerControlsState
       final labels = [l10n.fit, l10n.zoom, l10n.stretch];
 
       widget.onResize?.call(modes[_resizeMode]);
-      ref.read(playerGestureHandlerProvider.notifier).showToast(labels[_resizeMode], Icons.aspect_ratio);
+      ref
+          .read(playerGestureHandlerProvider.notifier)
+          .showToast(labels[_resizeMode], Icons.aspect_ratio);
     });
   }
 
   Future<void> _handleDragStart(DragStartDetails details) async {
     final size = MediaQuery.sizeOf(context);
-    await ref.read(playerGestureHandlerProvider.notifier).handleDragStart(details, size.width, size.height);
+    await ref
+        .read(playerGestureHandlerProvider.notifier)
+        .handleDragStart(details, size.width, size.height);
   }
 
   void _handleDragUpdate(DragUpdateDetails details) {
@@ -580,21 +470,27 @@ class SkyStreamPlayerControlsState
   Future<void> _handleHorizontalDragStart(DragStartDetails details) async {
     final size = MediaQuery.sizeOf(context);
     final bottomPadding = MediaQuery.viewPaddingOf(context).bottom;
-    await ref.read(playerGestureHandlerProvider.notifier).handleHorizontalDragStart(
-      details,
-      _isVisible,
-      size.width,
-      size.height,
-      bottomPadding,
-    );
+    await ref
+        .read(playerGestureHandlerProvider.notifier)
+        .handleHorizontalDragStart(
+          details,
+          _isVisible,
+          size.width,
+          size.height,
+          bottomPadding,
+        );
   }
 
   void _handleHorizontalDragUpdate(DragUpdateDetails details) {
-    ref.read(playerGestureHandlerProvider.notifier).handleHorizontalDragUpdate(details);
+    ref
+        .read(playerGestureHandlerProvider.notifier)
+        .handleHorizontalDragUpdate(details);
   }
 
   void _handleHorizontalDragEnd(DragEndDetails details) {
-    ref.read(playerGestureHandlerProvider.notifier).handleHorizontalDragEnd(details);
+    ref
+        .read(playerGestureHandlerProvider.notifier)
+        .handleHorizontalDragEnd(details);
   }
 
   String _formatDuration(Duration duration) {
@@ -724,6 +620,25 @@ class SkyStreamPlayerControlsState
     final sourceAttempts = ref.watch(
       playerControllerProvider.select((s) => s.sourceAttempts),
     );
+
+    // Sync local state for gesture handlers and legacy components
+    ref.listen(
+      playerControllerProvider.select((s) => s.position),
+      (_, next) => _position = next,
+    );
+    ref.listen(
+      playerControllerProvider.select((s) => s.duration),
+      (_, next) => _duration = next,
+    );
+    ref.listen(
+      playerControllerProvider.select((s) => s.isPlaying),
+      (_, next) => _isPlaying = next,
+    );
+
+    // Initial sync
+    _position = ref.read(playerControllerProvider).position;
+    _duration = ref.read(playerControllerProvider).duration;
+    _isPlaying = ref.read(playerControllerProvider).isPlaying;
     // Guard against PiP or small window size
     final size = MediaQuery.sizeOf(context);
     final isSmallWindow = size.width < 300 || size.height < 200;
@@ -825,10 +740,7 @@ class SkyStreamPlayerControlsState
                 ),
 
                 // OSD and volume overlay — only this subtree rebuilds on handler changes
-                PlayerOSDVolumeOverlay(
-                  getDuration: () => _duration,
-                  formatDuration: _formatDuration,
-                ),
+                PlayerOSDVolumeOverlay(formatDuration: _formatDuration),
 
                 // Resume Prompt Overlay
                 Builder(
@@ -1001,8 +913,6 @@ class SkyStreamPlayerControlsState
 
             // Playback controls - Extracted to component
             PlayerCenterControls(
-              player: widget.player,
-              videoViewController: widget.videoViewController,
               isLoading: widget.isLoading,
               isTv: _isTv,
               playFocusNode: _playFocusNode,
@@ -1032,11 +942,7 @@ class SkyStreamPlayerControlsState
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       // Progress bar with StreamBuilder
-                      PlayerProgressBar(
-                        player: widget.player,
-                        videoViewController: widget.videoViewController,
-                        onSeekStart: _cancelHideTimer,
-                      ),
+                      PlayerProgressBar(onSeekStart: _cancelHideTimer),
                       // Actions Row
                       FocusTraversalGroup(
                         policy: OrderedTraversalPolicy(),

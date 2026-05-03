@@ -1,25 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:media_kit/media_kit.dart';
-import 'package:video_view/video_view.dart' as vv;
 import '../player_controller.dart';
 import '../../../../shared/widgets/custom_widgets.dart';
 
-/// A self-contained progress bar widget that uses StreamBuilder to avoid
-/// rebuilding the parent widget on every position update.
+/// A self-contained progress bar widget that uses the PlayerController provider
+/// for position/duration updates to avoid rebuilding the parent widget.
 class PlayerProgressBar extends ConsumerStatefulWidget {
-  final Player player;
-  final vv.VideoController? videoViewController;
   final VoidCallback? onSeekStart;
   final VoidCallback? onSeekEnd;
 
-  const PlayerProgressBar({
-    super.key,
-    required this.player,
-    this.videoViewController,
-    this.onSeekStart,
-    this.onSeekEnd,
-  });
+  const PlayerProgressBar({super.key, this.onSeekStart, this.onSeekEnd});
 
   @override
   ConsumerState<PlayerProgressBar> createState() => _PlayerProgressBarState();
@@ -27,46 +17,6 @@ class PlayerProgressBar extends ConsumerStatefulWidget {
 
 class _PlayerProgressBarState extends ConsumerState<PlayerProgressBar> {
   double? _dragValue;
-
-  // ValueNotifiers so position/duration updates don't setState the whole widget.
-  final _vvPositionNotifier = ValueNotifier<int>(0);
-  final _vvDurationNotifier = ValueNotifier<int>(0);
-
-  @override
-  void initState() {
-    super.initState();
-    widget.videoViewController?.position.addListener(_onVvPosition);
-    widget.videoViewController?.mediaInfo.addListener(_onVvMediaInfo);
-  }
-
-  @override
-  void didUpdateWidget(PlayerProgressBar old) {
-    super.didUpdateWidget(old);
-    if (old.videoViewController != widget.videoViewController) {
-      old.videoViewController?.position.removeListener(_onVvPosition);
-      old.videoViewController?.mediaInfo.removeListener(_onVvMediaInfo);
-      widget.videoViewController?.position.addListener(_onVvPosition);
-      widget.videoViewController?.mediaInfo.addListener(_onVvMediaInfo);
-    }
-  }
-
-  void _onVvPosition() {
-    _vvPositionNotifier.value = widget.videoViewController?.position.value ?? 0;
-  }
-
-  void _onVvMediaInfo() {
-    _vvDurationNotifier.value =
-        widget.videoViewController?.mediaInfo.value?.duration ?? 0;
-  }
-
-  @override
-  void dispose() {
-    widget.videoViewController?.position.removeListener(_onVvPosition);
-    widget.videoViewController?.mediaInfo.removeListener(_onVvMediaInfo);
-    _vvPositionNotifier.dispose();
-    _vvDurationNotifier.dispose();
-    super.dispose();
-  }
 
   String _formatDuration(Duration duration) {
     final absDuration = duration.abs();
@@ -81,113 +31,55 @@ class _PlayerProgressBarState extends ConsumerState<PlayerProgressBar> {
 
   @override
   Widget build(BuildContext context) {
-    final useExoPlayer = ref.watch(
-      playerControllerProvider.select((s) => s.useExoPlayer),
-    );
+    final isLive = ref.watch(playerControllerProvider.select((s) => s.isLive));
     final canSeek = ref.watch(
       playerControllerProvider.select((s) => s.canSeek),
     );
 
-    if (useExoPlayer && widget.videoViewController != null) {
-      return _buildVideoViewBar(canSeek: canSeek);
-    }
-    return _buildMediaKitBar(canSeek: canSeek);
-  }
-
-  Widget _buildVideoViewBar({required bool canSeek}) {
-    final isLive = ref.watch(playerControllerProvider.select((s) => s.isLive));
-
-    return ValueListenableBuilder<int>(
-      valueListenable: _vvDurationNotifier,
-      builder: (context, durationMs, _) {
-        return ValueListenableBuilder<int>(
-          valueListenable: _vvPositionNotifier,
-          builder: (context, positionMs, _) {
-            final durationMsD = durationMs.toDouble();
-            final positionMsD = positionMs.toDouble();
-            final displayValue = _dragValue ?? positionMsD;
-            final displayDuration = Duration(
-              milliseconds: (_dragValue ?? positionMsD).toInt(),
-            );
-            final duration = Duration(milliseconds: durationMs);
-
-            return _buildRow(
-              duration: duration,
-              durationMs: durationMsD,
-              displayValue: displayValue,
-              displayDuration: displayDuration,
-              bufferWidget: null,
-              canSeek: canSeek,
-              onSeekEnd: (val) => ref
-                  .read(playerControllerProvider.notifier)
-                  .seekTo(Duration(milliseconds: val.toInt())),
-              isLive: isLive,
-            );
-          },
-        );
-      },
+    final position = ref.watch(
+      playerControllerProvider.select((s) => s.position),
     );
-  }
+    final duration = ref.watch(
+      playerControllerProvider.select((s) => s.duration),
+    );
+    final buffer = ref.watch(playerControllerProvider.select((s) => s.buffer));
 
-  Widget _buildMediaKitBar({required bool canSeek}) {
-    final isLive = ref.watch(playerControllerProvider.select((s) => s.isLive));
+    final durationMs = duration.inMilliseconds.toDouble();
+    final positionMs = position.inMilliseconds.toDouble();
+    final bufferMs = buffer.inMilliseconds.toDouble();
 
-    return StreamBuilder<Duration>(
-      stream: widget.player.stream.duration,
-      initialData: widget.player.state.duration,
-      builder: (context, durationSnapshot) {
-        final duration = durationSnapshot.data ?? Duration.zero;
-        final durationMs = duration.inMilliseconds.toDouble();
+    final displayValue = _dragValue ?? positionMs;
+    final displayDuration = _dragValue != null
+        ? Duration(milliseconds: _dragValue!.toInt())
+        : position;
 
-        return StreamBuilder<Duration>(
-          stream: widget.player.stream.position,
-          initialData: widget.player.state.position,
-          builder: (context, positionSnapshot) {
-            final position = positionSnapshot.data ?? Duration.zero;
-            final positionMs = position.inMilliseconds.toDouble();
-            final displayValue = _dragValue ?? positionMs;
-            final displayDuration = _dragValue != null
-                ? Duration(milliseconds: _dragValue!.toInt())
-                : position;
-
-            final bufferWidget = durationMs > 0
-                ? StreamBuilder<Duration>(
-                    stream: widget.player.stream.buffer,
-                    initialData: widget.player.state.buffer,
-                    builder: (context, bufferSnapshot) {
-                      final bufferMs = (bufferSnapshot.data ?? Duration.zero)
-                          .inMilliseconds
-                          .toDouble();
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 24),
-                        child: LinearProgressIndicator(
-                          value: (bufferMs / durationMs).clamp(0, 1),
-                          backgroundColor: Colors.transparent,
-                          valueColor: AlwaysStoppedAnimation<Color>(
-                            Colors.white.withValues(alpha: 0.25),
-                          ),
-                          minHeight: 4,
-                        ),
-                      );
-                    },
-                  )
-                : null;
-
-            return _buildRow(
-              duration: duration,
-              durationMs: durationMs,
-              displayValue: displayValue,
-              displayDuration: displayDuration,
-              bufferWidget: bufferWidget,
-              canSeek: canSeek,
-              onSeekEnd: (val) => ref
-                  .read(playerControllerProvider.notifier)
-                  .seekTo(Duration(milliseconds: val.toInt())),
-              isLive: isLive,
-            );
-          },
-        );
-      },
+    return _buildRow(
+      duration: duration,
+      durationMs: durationMs,
+      displayValue: displayValue,
+      displayDuration: displayDuration,
+      bufferWidget: durationMs > 0
+          ? LayoutBuilder(
+              builder: (context, constraints) {
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: Container(
+                    height: 4,
+                    width: (bufferMs / durationMs * constraints.maxWidth).clamp(
+                      0.0,
+                      constraints.maxWidth,
+                    ),
+                    color: Colors.white24,
+                  ),
+                );
+              },
+            )
+          : null,
+      canSeek: canSeek,
+      onSeekEnd: (val) => ref
+          .read(playerControllerProvider.notifier)
+          .seekTo(Duration(milliseconds: val.toInt())),
+      isLive: isLive,
     );
   }
 
@@ -221,7 +113,7 @@ class _PlayerProgressBarState extends ConsumerState<PlayerProgressBar> {
           child: Stack(
             alignment: Alignment.center,
             children: [
-              ?bufferWidget,
+              if (bufferWidget != null) bufferWidget,
               SliderTheme(
                 data: SliderThemeData(
                   trackHeight: 4,
@@ -271,9 +163,12 @@ class _PlayerProgressBarState extends ConsumerState<PlayerProgressBar> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             decoration: BoxDecoration(
-              color: Colors.red.withValues(alpha: 50/255),
+              color: Colors.red.withValues(alpha: 50 / 255),
               borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: Colors.red.withValues(alpha: 120/255), width: 1),
+              border: Border.all(
+                color: Colors.red.withValues(alpha: 120 / 255),
+                width: 1,
+              ),
             ),
             child: const Text(
               "🔴  LIVE",
@@ -304,8 +199,6 @@ class _PlayerProgressBarState extends ConsumerState<PlayerProgressBar> {
 }
 
 class PlayerPlayPauseButton extends StatelessWidget {
-  final Player player;
-  final vv.VideoController? videoViewController;
   final bool isLoading;
   final bool isTv;
   final FocusNode? focusNode;
@@ -313,8 +206,6 @@ class PlayerPlayPauseButton extends StatelessWidget {
 
   const PlayerPlayPauseButton({
     super.key,
-    required this.player,
-    this.videoViewController,
     this.isLoading = false,
     this.isTv = false,
     this.focusNode,
@@ -328,34 +219,14 @@ class PlayerPlayPauseButton extends StatelessWidget {
         final isBuffering = ref.watch(
           playerControllerProvider.select((s) => s.isBuffering),
         );
-        final useExoPlayer = ref.watch(
-          playerControllerProvider.select((s) => s.useExoPlayer),
+
+        final isPlaying = ref.watch(
+          playerControllerProvider.select((s) => s.isPlaying),
         );
 
-        if (useExoPlayer && videoViewController != null) {
-          return ListenableBuilder(
-            listenable: videoViewController!.playbackState,
-            builder: (context, _) {
-              final isPlaying =
-                  videoViewController!.playbackState.value ==
-                  vv.VideoControllerPlaybackState.playing;
-              return _buildButton(
-                isPlaying: isPlaying,
-                isSpinning: isBuffering || isLoading,
-              );
-            },
-          );
-        }
-
-        return StreamBuilder<bool>(
-          stream: player.stream.playing,
-          initialData: player.state.playing,
-          builder: (context, snapshot) {
-            return _buildButton(
-              isPlaying: snapshot.data ?? false,
-              isSpinning: isBuffering || isLoading,
-            );
-          },
+        return _buildButton(
+          isPlaying: isPlaying,
+          isSpinning: isBuffering || isLoading,
         );
       },
     );
@@ -366,7 +237,7 @@ class PlayerPlayPauseButton extends StatelessWidget {
       showFocusHighlight: isTv,
       autofocus: true,
       focusNode: focusNode,
-      onPressed: onPressed ?? () => player.playOrPause(),
+      onPressed: onPressed,
       shape: const CircleBorder(),
       child: Container(
         padding: const EdgeInsets.all(8),
@@ -417,7 +288,8 @@ class PlayerBufferingIndicator extends StatelessWidget {
 
         // If controls are visible, the play button already shows a spinner; skip.
         // If the user hasn't skipped and we are loading, the primary loading overlay is visible; skip.
-        if ((!isBuffering && !isLoading) || isVisible) return const SizedBox.shrink();
+        if ((!isBuffering && !isLoading) || isVisible)
+          return const SizedBox.shrink();
         if (isLoading && !userSkippedOverlay) return const SizedBox.shrink();
 
         return Positioned.fill(

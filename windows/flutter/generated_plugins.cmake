@@ -8,14 +8,12 @@ list(APPEND FLUTTER_PLUGIN_LIST
   flutter_inappwebview_windows
   flutter_js
   flutter_volume_controller
-  media_kit_libs_windows_video
-  media_kit_video
+  fvp
   permission_handler_windows
   screen_brightness_windows
   screen_retriever_windows
   share_plus
   url_launcher_windows
-  video_view
   window_manager
 )
 

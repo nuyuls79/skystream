@@ -4,7 +4,7 @@ import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart'; // For kReleaseMode
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:media_kit/media_kit.dart';
+
 import 'package:window_manager/window_manager.dart';
 import 'core/theme/theme_provider.dart';
 import 'core/router/app_router.dart';
@@ -23,10 +23,26 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:skystream/l10n/generated/app_localizations.dart';
 import 'core/providers/locale_provider.dart';
 import 'core/network/cloudflare_bypass.dart';
+import 'package:fvp/fvp.dart' as fvp;
+import 'package:fvp/mdk.dart' as mdk;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  MediaKit.ensureInitialized();
+
+  // Initialize FVP (libmdk) player engine with platform-aware decoders.
+  fvp.registerWith(
+    options: {
+      'platforms': ['windows', 'macos', 'linux', 'android', 'ios'],
+      'lowLatency': 0, // controlled per-stream, not globally
+    },
+  );
+
+  // Route MDK native logs to Flutter's debug output.
+  if (kDebugMode) {
+    mdk.setLogHandler((level, msg) {
+      debugPrint('[MDK/$level] $msg');
+    });
+  }
 
   // Silence logs in release mode
   if (kReleaseMode) {

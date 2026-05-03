@@ -7,9 +7,6 @@ import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:media_kit/media_kit.dart' hide PlayerState;
-import 'package:media_kit_video/media_kit_video.dart';
-import 'package:video_view/video_view.dart' as vv;
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:skystream/l10n/generated/app_localizations.dart';
 
@@ -37,11 +34,6 @@ class PlayerScreen extends ConsumerStatefulWidget {
 
 class _PlayerScreenState extends ConsumerState<PlayerScreen>
     with WidgetsBindingObserver {
-  late final Player _player;
-  late final VideoController _videoController; // media_kit renderer
-  late final vv.VideoController
-  _videoViewController; // video_view (ExoPlayer/AVPlayer)
-
   final ValueNotifier<BoxFit> _videoFit = ValueNotifier(BoxFit.contain);
   final ValueNotifier<bool> _controlsVisible = ValueNotifier(true);
 
@@ -56,7 +48,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   @override
   void initState() {
     super.initState();
-    MediaKit.ensureInitialized();
     WidgetsBinding.instance.addObserver(this);
 
     final deviceProfile = ref.read(deviceProfileProvider).asData?.value;
@@ -67,27 +58,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     }
     WakelockPlus.enable();
-
-    // Initialize player with larger buffer for torrent streaming
-    _player = Player(
-      configuration: const PlayerConfiguration(
-        bufferSize: 128 * 1024 * 1024, // 128MB
-      ),
-    );
-
-    // Increase network timeout to allow TorrServer to pre-buffer
-    if (_player.platform is NativePlayer) {
-      final native = _player.platform as NativePlayer;
-      native.setProperty('network-timeout', '120');
-      native.setProperty('force-seekable', 'yes');
-      // Increase metadata probing depth to match VLC (resolves missing language tags)
-      native.setProperty('demuxer-lavf-probesize', '33554432'); // 32MB
-      native.setProperty('demuxer-lavf-analyzeduration', '20'); // 20s
-    }
-    _videoController = VideoController(_player);
-
-    // Phase 8: Initialize video_view engine (ExoPlayer on Android, AVPlayer on iOS/macOS)
-    _videoViewController = vv.VideoController(autoPlay: true);
 
     ref.listenManual<AsyncValue<PlayerSettings>>(playerSettingsProvider, (
       _,
@@ -106,11 +76,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _playerController.init(
-        player: _player,
         item: widget.item,
         videoUrl: widget.videoUrl,
         episode: widget.episode,
-        videoViewController: _videoViewController,
       );
     });
   }
@@ -118,11 +86,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused) {
-      final ctrl = ref.read(playerControllerProvider);
-      _wasPlayingBeforeBackground = ctrl.useExoPlayer
-          ? _videoViewController.playbackState.value ==
-                vv.VideoControllerPlaybackState.playing
-          : _player.state.playing;
+      _wasPlayingBeforeBackground = _playerController.state.isPlaying;
       _playerController.saveProgress();
       _playerController.pause();
     } else if (state == AppLifecycleState.resumed) {
@@ -144,17 +108,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     WidgetsBinding.instance.removeObserver(this);
     _playerController.disposeController();
 
-    _player.dispose();
-    _videoViewController.dispose();
     _controlsVisible.dispose();
     _videoFit.dispose();
 
     WakelockPlus.disable();
     if (Platform.isAndroid || Platform.isIOS) {
-      // Always restore system UI mode — immersiveSticky is set for all Android
-      // (including TV/FireTV) in initState, so it must always be cleared here.
-      // On FireTV, leaving immersiveSticky active after the player is popped
-      // causes the system to suppress hardware back-button key events.
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       if (!_isTv) {
         if (_isTablet) {
@@ -179,7 +137,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     // Only handle KeyDown and KeyRepeat for volume/seeking
-    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent)
+      return KeyEventResult.ignored;
 
     // TV Navigation Logic
     if (_isTv) {
@@ -280,7 +239,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     final isLoading = ref.watch(
       playerControllerProvider.select((s) => s.isLoading),
     );
-    final subtitleSettings = ref.watch(playerSettingsProvider).asData?.value;
 
     if (errorMessage != null) {
       return Scaffold(
@@ -293,12 +251,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Icon(Icons.error_outline, color: Colors.red, size: 56),
+                      const Icon(
+                        Icons.error_outline,
+                        color: Colors.red,
+                        size: 56,
+                      ),
                       const SizedBox(height: 16),
                       Text(
                         AppLocalizations.of(context)!.playbackError,
                         style: const TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.bold),
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Text(
@@ -317,16 +281,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   ),
                 ),
               ),
-              // Top-left back button — always visible for iOS/desktop
-              // where there may be no system back gesture.
               Positioned(
                 top: 8,
                 left: 8,
-                  child: IconButton(
-                    icon: const Icon(Icons.arrow_back),
-                    tooltip: AppLocalizations.of(context)!.goBack,
-                    onPressed: _handleBack,
-                  ),
+                child: IconButton(
+                  icon: const Icon(Icons.arrow_back),
+                  tooltip: AppLocalizations.of(context)!.goBack,
+                  onPressed: _handleBack,
+                ),
               ),
             ],
           ),
@@ -341,17 +303,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
           canPop: false,
           onPopInvokedWithResult: (didPop, result) async {
             if (didPop) return;
-            // On TV: intercept back to hide controls first (if controls are
-            // visible and video is playing), so the user doesn't exit by accident.
-            // On phone/tablet: always pop directly — no two-step back.
             if (_isTv && _controlsVisible.value) {
-              final isPlaying = ref.read(
-                playerControllerProvider.select((s) => s.useExoPlayer),
-              )
-                  ? _videoViewController.playbackState.value ==
-                        vv.VideoControllerPlaybackState.playing
-                  : _player.state.playing;
-              if (isPlaying) {
+              if (_playerController.state.isPlaying) {
                 _controlsKeyFinal.currentState?.hideControls();
                 return;
               }
@@ -368,91 +321,56 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                     child: ValueListenableBuilder<BoxFit>(
                       valueListenable: _videoFit,
                       builder: (_, fit, child) => Center(
-                        // Phase 8: Switch engine based on stream type
-                        child: Consumer(
-                          builder: (context, ref, _) {
-                            final useExoPlayer = ref.watch(
-                              playerControllerProvider.select(
-                                (s) => s.useExoPlayer,
-                              ),
-                            );
-                            if (useExoPlayer) {
-                              return vv.VideoView(
-                                controller: _videoViewController,
-                                videoFit: fit,
-                              );
-                            }
-                            return Video(
-                              controller: _videoController,
-                              fit: fit,
-                              subtitleViewConfiguration:
-                                  const SubtitleViewConfiguration(
-                                    visible: false,
-                                  ),
-                              controls: (state) => const SizedBox.shrink(),
-                            );
-                          },
+                        child: Container(
+                          color: Colors.black,
+                          child: !_playerController.isInitialized
+                              ? const SizedBox.shrink()
+                              : ValueListenableBuilder<int?>(
+                                  valueListenable:
+                                      _playerController.player.textureId,
+                                  builder: (context, textureId, child) {
+                                    if (textureId == null) {
+                                      return const SizedBox.shrink();
+                                    }
+                                    return SizedBox.expand(
+                                      child: FittedBox(
+                                        fit: fit,
+                                        child: SizedBox(
+                                          width:
+                                              _playerController
+                                                  .player
+                                                  .mediaInfo
+                                                  .video
+                                                  ?.firstOrNull
+                                                  ?.codec
+                                                  .width
+                                                  .toDouble() ??
+                                              1920,
+                                          height:
+                                              _playerController
+                                                  .player
+                                                  .mediaInfo
+                                                  .video
+                                                  ?.firstOrNull
+                                                  ?.codec
+                                                  .height
+                                                  .toDouble() ??
+                                              1080,
+                                          child: Texture(textureId: textureId),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
                         ),
                       ),
                     ),
-                  ),
-                  Consumer(
-                    builder: (context, ref, _) {
-                      final useExoPlayer = ref.watch(
-                        playerControllerProvider.select((s) => s.useExoPlayer),
-                      );
-                      if (useExoPlayer) {
-                        return const SizedBox.shrink();
-                      }
-
-                      return Positioned(
-                        bottom:
-                            (controlsVisible ? 120.0 : 20.0) +
-                            ((100 -
-                                    (subtitleSettings?.subtitlePosition ??
-                                        100.0)) *
-                                (MediaQuery.sizeOf(context).height * 0.008)),
-                        left: 20,
-                        right: 20,
-                        child: SubtitleView(
-                          controller: _videoController,
-                          configuration: SubtitleViewConfiguration(
-                            style: TextStyle(
-                              fontSize: subtitleSettings?.subtitleSize ?? 22.0,
-                              color: Color(
-                                subtitleSettings?.subtitleColor ?? 0xFFFFFFFF,
-                              ),
-                              backgroundColor:
-                                  Color(
-                                    subtitleSettings?.subtitleBackgroundColor ??
-                                        0x00000000,
-                                  ).withValues(
-                                    alpha:
-                                        subtitleSettings
-                                            ?.subtitleBackgroundOpacity ??
-                                        0.0,
-                                  ),
-                              shadows: const [
-                                Shadow(
-                                  offset: Offset(0, 1),
-                                  blurRadius: 2,
-                                  color: Colors.black,
-                                ),
-                              ],
-                            ),
-                            padding: EdgeInsets.zero,
-                          ),
-                        ),
-                      );
-                    },
                   ),
                   Positioned.fill(
                     child: RepaintBoundary(
                       child: SkyStreamPlayerControls(
                         key: _controlsKeyFinal,
                         isLoading: isLoading,
-                        player: _player,
-                        videoViewController: _videoViewController,
                         title: widget.item.title,
                         subtitle: ref
                             .read(playerControllerProvider)

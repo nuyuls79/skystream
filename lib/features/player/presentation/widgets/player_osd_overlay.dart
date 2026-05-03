@@ -1,41 +1,37 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../player_controller.dart';
 import '../player_gesture_handler.dart';
 
 /// Rebuilds only when [PlayerGestureHandler] notifies (OSD/volume state).
 /// Use this instead of listening to the handler in the full controls to avoid
 /// rebuilding the entire player UI on every OSD change.
 class PlayerOSDVolumeOverlay extends ConsumerWidget {
-  const PlayerOSDVolumeOverlay({
-    super.key,
-    required this.getDuration,
-    required this.formatDuration,
-  });
+  const PlayerOSDVolumeOverlay({super.key, required this.formatDuration});
 
-  final Duration Function() getDuration;
   final String Function(Duration) formatDuration;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final state = ref.watch(playerGestureHandlerProvider);
     final handler = ref.read(playerGestureHandlerProvider.notifier);
+    final duration = ref.watch(
+      playerControllerProvider.select((s) => s.duration),
+    );
 
     return Stack(
       children: [
         if (state.swipeSeekValue != null)
           Center(
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 24,
-                vertical: 12,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
               decoration: BoxDecoration(
                 color: Colors.black54,
                 borderRadius: BorderRadius.circular(16),
               ),
               child: Text(
-                '${formatDuration(state.swipeSeekValue!)} / ${formatDuration(getDuration())}',
+                '${formatDuration(state.swipeSeekValue!)} / ${formatDuration(duration)}',
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 24,

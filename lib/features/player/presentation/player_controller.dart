@@ -6,13 +6,12 @@ import 'package:flutter/foundation.dart';
 import 'package:collection/collection.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
-import 'package:media_kit/media_kit.dart';
+
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:file_picker/file_picker.dart';
-import 'package:video_view/video_view.dart'
-    show VideoController, SubtitleTrackConfig, VideoControllerPlaybackState;
+import 'package:fvp/mdk.dart' as mdk;
 
 import '../../../../core/services/download_service.dart';
 import '../../../../core/domain/entity/multimedia_item.dart';
@@ -170,8 +169,6 @@ class PlayerState {
   final String? imdbId;
   final int? tmdbId;
 
-  /// Whether the active engine is video_view (ExoPlayer/AVPlayer) instead of media_kit.
-  final bool useExoPlayer;
   final bool isSeekable;
   final PlaybackUiPhase uiPhase;
   final List<SourceAttemptEntry> sourceAttempts;
@@ -181,6 +178,15 @@ class PlayerState {
   /// Non-null when a saved position was found; shows resume prompt instead of seeking silently.
   final int? resumePromptPosition;
   final bool userSkippedOverlay;
+
+  /// FVP playback state fields — updated by polling timer and event callbacks.
+  final Duration position;
+  final Duration duration;
+  final Duration buffer;
+  final bool isPlaying;
+  final int? textureId;
+  final int videoWidth;
+  final int videoHeight;
 
   const PlayerState({
     this.errorMessage,
@@ -198,11 +204,10 @@ class PlayerState {
     this.showEpisodeList = false,
     this.playbackSpeed = 1.0,
     this.isLive = false,
-    this.isSeekable = false,
+    this.isSeekable = true,
     this.subtitleDelay = 0.0,
     this.imdbId,
     this.tmdbId,
-    this.useExoPlayer = false,
     this.uiPhase = const PlaybackUiPhase(
       kind: PlaybackUiPhaseKind.bootstrapping,
       fullscreenBlocking: true,
@@ -212,6 +217,13 @@ class PlayerState {
     this.sourceSessionId = 0,
     this.resumePromptPosition,
     this.userSkippedOverlay = false,
+    this.position = Duration.zero,
+    this.duration = Duration.zero,
+    this.buffer = Duration.zero,
+    this.isPlaying = false,
+    this.textureId,
+    this.videoWidth = 0,
+    this.videoHeight = 0,
   });
 
   // Derived from uiPhase — no separate field needed.
@@ -225,14 +237,13 @@ class PlayerState {
 
   bool get isBuffering => uiPhase.kind == PlaybackUiPhaseKind.bufferingRuntime;
 
-  bool get canSeek => !useExoPlayer || isSeekable;
+  bool get canSeek => isSeekable;
   bool get supportsPlaybackSpeed => !isLive;
-  double get maxPlaybackSpeed => useExoPlayer ? 2.0 : 3.0;
-  bool get supportsVolumeBoost => !useExoPlayer;
-  bool get supportsSubtitleDelay => !useExoPlayer;
-  bool get supportsSubtitleStyling => !useExoPlayer;
-  bool get supportsExternalSubtitleLoading =>
-      !useExoPlayer || Platform.isAndroid;
+  double get maxPlaybackSpeed => 3.0;
+  bool get supportsVolumeBoost => true;
+  bool get supportsSubtitleDelay => true;
+  bool get supportsSubtitleStyling => true;
+  bool get supportsExternalSubtitleLoading => true;
 
   PlayerState copyWith({
     String? errorMessage,
@@ -254,13 +265,19 @@ class PlayerState {
     double? subtitleDelay,
     String? imdbId,
     int? tmdbId,
-    bool? useExoPlayer,
     PlaybackUiPhase? uiPhase,
     List<SourceAttemptEntry>? sourceAttempts,
     Object? currentAttemptIndex = _keep,
     int? sourceSessionId,
     Object? resumePromptPosition = _keep,
     bool? userSkippedOverlay,
+    Duration? position,
+    Duration? duration,
+    Duration? buffer,
+    bool? isPlaying,
+    int? textureId,
+    int? videoWidth,
+    int? videoHeight,
   }) {
     return PlayerState(
       errorMessage: errorMessage ?? this.errorMessage,
@@ -286,7 +303,6 @@ class PlayerState {
       subtitleDelay: subtitleDelay ?? this.subtitleDelay,
       imdbId: imdbId ?? this.imdbId,
       tmdbId: tmdbId ?? this.tmdbId,
-      useExoPlayer: useExoPlayer ?? this.useExoPlayer,
       uiPhase: uiPhase ?? this.uiPhase,
       sourceAttempts: sourceAttempts ?? this.sourceAttempts,
       currentAttemptIndex: currentAttemptIndex == _keep
@@ -297,6 +313,13 @@ class PlayerState {
           ? this.resumePromptPosition
           : resumePromptPosition as int?,
       userSkippedOverlay: userSkippedOverlay ?? this.userSkippedOverlay,
+      position: position ?? this.position,
+      duration: duration ?? this.duration,
+      buffer: buffer ?? this.buffer,
+      isPlaying: isPlaying ?? this.isPlaying,
+      textureId: textureId ?? this.textureId,
+      videoWidth: videoWidth ?? this.videoWidth,
+      videoHeight: videoHeight ?? this.videoHeight,
     );
   }
 }
@@ -328,27 +351,22 @@ class PlayerTrackSelectionSnapshot {
 }
 
 class PlayerController extends Notifier<PlayerState> {
-  late Player _player;
-  VideoController? _videoViewController;
+  final mdk.Player _player = mdk.Player();
   late MultimediaItem _item;
   late String _videoUrl;
   Episode? _episode;
   Timer? _torrentPollTimer;
+  Timer? _positionTimer;
   bool _isPolling = false;
   bool _isInitialized = false;
   bool _isDisposed = false;
 
-  Player get player => _player;
-  VideoController? get videoViewController => _videoViewController;
+  mdk.Player get player => _player;
+  bool get isInitialized => _isInitialized;
   bool get isDisposed => _isDisposed;
   PlayerState get currentState => state;
-  List<SubtitleFile> get userAddedExternalSubtitles => _userAddedExternalSubtitles;
-
-  Set<String>? get pendingVideoViewSubtitleIdsBeforeReload => _pendingVideoViewSubtitleIdsBeforeReload;
-  set pendingVideoViewSubtitleIdsBeforeReload(Set<String>? values) => _pendingVideoViewSubtitleIdsBeforeReload = values;
-
-  bool get selectNewestVideoViewSubtitleAfterReload => _selectNewestVideoViewSubtitleAfterReload;
-  set selectNewestVideoViewSubtitleAfterReload(bool value) => _selectNewestVideoViewSubtitleAfterReload = value;
+  List<SubtitleFile> get userAddedExternalSubtitles =>
+      _userAddedExternalSubtitles;
 
   void updateState(PlayerState Function(PlayerState s) update) {
     state = update(state);
@@ -374,48 +392,9 @@ class PlayerController extends Notifier<PlayerState> {
         _isLiveStream(url);
   }
 
-  bool _canUseVideoViewForStream(
-    String playUrl,
-    StreamResult stream, {
-    required bool isLive,
-  }) {
-    // Preserve the current product behavior: video_view is the native live path.
-    if (_videoViewController == null || Platform.isLinux || !isLive) {
-      return false;
-    }
-
-    // AVPlayer/Windows native backends do not handle DASH playback reliably here.
-    // Check both the resolved URL and the original stream URL to catch proxied
-    // or query-param-based MPD streams that lack a .mpd extension in the resolved URL.
-    if ((Platform.isMacOS || Platform.isIOS || Platform.isWindows) &&
-        (_isDashStreamUrl(playUrl) || _isDashStreamUrl(stream.url))) {
-      return false;
-    }
-
-    // Only Android currently implements the video_view DRM path end-to-end.
-    if (!Platform.isAndroid && _streamRequiresNativeDrm(stream)) {
-      return false;
-    }
-
-    return true;
-  }
-
-  bool get _videoViewSupportsMergedExternalSubtitles => Platform.isAndroid;
-
   // Track last saved position for threshold-based saving
   Duration _lastSavedPosition = Duration.zero;
   static const double _saveThresholdPercent = 0.05; // 5% of video
-
-  // Subscriptions to prevent leaks
-  StreamSubscription<dynamic>? _videoParamsSub;
-  StreamSubscription<dynamic>? _errorSub;
-  StreamSubscription<dynamic>? _playingSub;
-  StreamSubscription<dynamic>? _positionSub;
-  StreamSubscription<dynamic>? _durationSub;
-  StreamSubscription<dynamic>? _bufferingSub;
-  StreamSubscription<dynamic>? _completedSub;
-  StreamSubscription<dynamic>? _rateSub;
-  StreamSubscription<dynamic>? _logSub;
 
   // Stall Watchdog state
   Duration? _lastPosition;
@@ -428,11 +407,17 @@ class PlayerController extends Notifier<PlayerState> {
   bool _isApplyingPendingResumeSeek = false;
   double _lastNonZeroVolumeLevel = 1.0;
   final List<SubtitleFile> _userAddedExternalSubtitles = [];
-  Set<String>? _pendingVideoViewSubtitleIdsBeforeReload;
-  bool _selectNewestVideoViewSubtitleAfterReload = false;
   bool _hasConfirmedPlaybackFrame = false;
   bool _suppressNextEpisodeDetection = false;
   bool _manualSelectionPending = false;
+
+  /// True while _player.prepare() is awaiting. Prevents the status callback
+  /// from triggering a premature failover — prepare() is the source of truth.
+  bool _isPreparing = false;
+
+  StreamSubscription? _stateSub;
+  StreamSubscription? _statusSub;
+  StreamSubscription? _eventSub;
 
   String _phaseTitle([String? fallback]) {
     if (state.playerTitle.isNotEmpty) return state.playerTitle;
@@ -632,19 +617,11 @@ class PlayerController extends Notifier<PlayerState> {
   PlayerState build() {
     ref.keepAlive();
     // Safety net: if the provider is somehow disposed without
-    // disposeController() being called, clean up subscriptions.
+    // disposeController() being called, clean up resources.
     ref.onDispose(() {
       _torrentPollTimer?.cancel();
       _stallTimer?.cancel();
-      _videoParamsSub?.cancel();
-      _errorSub?.cancel();
-      _playingSub?.cancel();
-      _positionSub?.cancel();
-      _durationSub?.cancel();
-      _bufferingSub?.cancel();
-      _completedSub?.cancel();
-      _rateSub?.cancel();
-      _logSub?.cancel();
+      _positionTimer?.cancel();
     });
     return const PlayerState();
   }
@@ -655,27 +632,33 @@ class PlayerController extends Notifier<PlayerState> {
   String? get currentEpisodeUrl => _episode?.url ?? _videoUrl;
 
   Future<void> init({
-    required Player player,
     required MultimediaItem item,
     required String videoUrl,
     Episode? episode,
-    VideoController? videoViewController,
   }) async {
     state = const PlayerState(); // Resets all fields including errorMessage
-    _logSub?.cancel();
-    _logSub = null;
+    _positionTimer?.cancel();
     _hasConfirmedPlaybackFrame = false;
     _manualSelectionPending = false;
     _revertMessage = null;
-    _player = player;
-    _videoViewController = videoViewController;
+
+    // The FVP (mdk) player instance is eagerly allocated.
+
+    // Platform-aware hardware decoding.
+    final settings = ref.read(playerSettingsProvider).asData?.value;
+    if (settings?.hardwareDecoding ?? true) {
+      _player.videoDecoders = Platform.isWindows
+          ? ['D3D11', 'FFmpeg']
+          : ['VT', 'MediaCodec', 'FFmpeg'];
+    } else {
+      _player.videoDecoders = ['FFmpeg'];
+    }
+
     _videoUrl = videoUrl;
     _episode = episode;
     _pendingResumeSeekPosition = null;
     _isApplyingPendingResumeSeek = false;
     _userAddedExternalSubtitles.clear();
-    _pendingVideoViewSubtitleIdsBeforeReload = null;
-    _selectNewestVideoViewSubtitleAfterReload = false;
 
     _item = item;
 
@@ -726,13 +709,8 @@ class PlayerController extends Notifier<PlayerState> {
       detail: "Preparing playback...",
     );
 
-    _setupEventDrivenProgressSaving();
-    _setupErrorListener();
-    _setupVideoParamsListener();
-    _setupDurationListener();
-    _setupBufferingMonitor();
-    _setupRateListener();
-    _setupVideoViewListeners();
+    _setupFvpEventListeners();
+    _startPositionPolling();
 
     state = state.copyWith(
       isLive:
@@ -746,70 +724,34 @@ class PlayerController extends Notifier<PlayerState> {
     await applySubtitleSettings();
   }
 
-  void _setupVideoViewListeners() {
-    if (_videoViewController == null) return;
+  /// Registers FVP (mdk) native event callbacks for state changes, media
+  /// status, errors, and buffering/completion events.
+  void _setupFvpEventListeners() {
+    // State change callback: playing, paused, stopped.
+    _stateSub = _player.onStateChanged.listen((event) {
+      if (_isDisposed) return;
+      final oldState = event.oldValue;
+      final newState = event.newValue;
 
-    _videoViewController!.mediaInfo.addListener(() {
-      final info = _videoViewController!.mediaInfo.value;
-      if (info != null) {
-        final detectedIsLive =
-            _item.contentType == MultimediaContentType.livestream
-            ? true
-            : info.isLive;
-        if (info.isSeekable != state.isSeekable ||
-            detectedIsLive != state.isLive) {
-          state = state.copyWith(
-            isSeekable: info.isSeekable,
-            isLive: detectedIsLive,
-          );
-        }
+      final isPlaying = newState == mdk.PlaybackState.playing;
+      state = state.copyWith(isPlaying: isPlaying);
 
-        if (!_hasConfirmedPlaybackFrame &&
-            (info.duration > 0 || info.isLive) &&
-            state.uiPhase.kind == PlaybackUiPhaseKind.openingSource) {
-          _enterStartupPhase(
-            kind: PlaybackUiPhaseKind.bufferingInitial,
-            detail: detectedIsLive
-                ? "Connecting to live stream..."
-                : "Buffering selected source...",
-            attemptIndex: state.currentAttemptIndex == null
-                ? null
-                : state.currentAttemptIndex! + 1,
-            attemptTotal: state.sourceAttempts.isEmpty
-                ? null
-                : state.sourceAttempts.length,
-          );
-        }
-
-        // Re-enable next-episode detection once ExoPlayer reports a confirmed
-        // non-zero duration (mirrors the media_kit _setupDurationListener fix).
-        if ((info.duration > 0 || info.isLive) &&
-            _suppressNextEpisodeDetection) {
-          _suppressNextEpisodeDetection = false;
-        }
-
-        if (_selectNewestVideoViewSubtitleAfterReload &&
-            info.subtitleTracks.isNotEmpty) {
-          final previousIds =
-              _pendingVideoViewSubtitleIdsBeforeReload ?? const <String>{};
-          final newTrackId =
-              info.subtitleTracks.keys.firstWhereOrNull(
-                (id) => !previousIds.contains(id),
-              ) ??
-              info.subtitleTracks.keys.lastOrNull;
-          if (newTrackId != null) {
-            _videoViewController!.setShowSubtitle(true);
-            _videoViewController!.setOverrideSubtitle(newTrackId);
-          }
-          _pendingVideoViewSubtitleIdsBeforeReload = null;
-          _selectNewestVideoViewSubtitleAfterReload = false;
-        }
+      if (!isPlaying && oldState == mdk.PlaybackState.playing) {
+        saveProgress();
       }
     });
 
-    _videoViewController!.loading.addListener(() {
-      final isLoading = _videoViewController!.loading.value;
-      if (isLoading) {
+    // Media status callback: loaded, buffering, end-of-file.
+    _statusSub = _player.onMediaStatus.listen((event) {
+      if (_isDisposed) return;
+      final oldStatus = event.oldValue;
+      final newStatus = event.newValue;
+      if (kDebugMode) {
+        debugPrint('[FVP] MediaStatus: $oldStatus → $newStatus');
+      }
+
+      // Buffering detection
+      if (newStatus.test(mdk.MediaStatus.buffering)) {
         _handleBufferStall();
         _stallTimer?.cancel();
         _stallTimer = Timer(const Duration(milliseconds: 200), () {
@@ -835,89 +777,20 @@ class PlayerController extends Notifier<PlayerState> {
             );
           }
         });
-      } else {
+      } else if (newStatus.test(mdk.MediaStatus.loaded)) {
         _stallTimer?.cancel();
         if (_hasConfirmedPlaybackFrame &&
             state.uiPhase.kind == PlaybackUiPhaseKind.bufferingRuntime) {
           _setIdlePhase();
         }
       }
-    });
 
-    _videoViewController!.error.addListener(() {
-      final error = _videoViewController!.error.value;
-      if (error != null) {
-        _pendingVideoViewSubtitleIdsBeforeReload = null;
-        _selectNewestVideoViewSubtitleAfterReload = false;
-        if (kDebugMode) debugPrint("VideoView Player Error: $error");
-        if (!_hasConfirmedPlaybackFrame ||
-            (_videoViewController!.position.value) == 0) {
-          // Error before playback confirmed — try next source.
-          _markSourceAttempt(
-            state.currentStreamIndex,
-            SourceAttemptStatus.failed,
-            isCurrent: false,
-          );
-          if (_manualSelectionPending) {
-            _manualSelectionPending = false;
-            revertToPreviousStream(
-              "Selected source is not playable. Reverting back to previous source.",
-            );
-          } else {
-            retryNextStream(sourceSessionId: state.sourceSessionId);
+      // End of file: auto-reconnect for live streams.
+      if (newStatus.test(mdk.MediaStatus.end)) {
+        if (state.isLive && state.currentStream != null) {
+          if (kDebugMode) {
+            debugPrint("Live stream EOF. Triggering auto-reconnect...");
           }
-        } else {
-          // Error during active playback.
-          if (state.isLive && state.currentStream != null) {
-            if (_isRecoveringFromStall) return; // already reconnecting
-            if (kDebugMode) {
-              debugPrint(
-                "VideoView live stream error. Triggering reconnect...",
-              );
-            }
-            _isRecoveringFromStall = true;
-            _enterRuntimePhase(
-              kind: PlaybackUiPhaseKind.reconnectingLive,
-              detail: "Reconnecting to live stream...",
-            );
-            changeStream(state.currentStream!, resetPosition: true);
-            Future.delayed(const Duration(seconds: 10), () {
-              _isRecoveringFromStall = false;
-            });
-            return;
-          }
-          _markSourceAttempt(
-            state.currentStreamIndex,
-            SourceAttemptStatus.failed,
-            isCurrent: false,
-          );
-          _revertMessage =
-              "Current source stopped unexpectedly. Trying next available source...";
-          retryNextStream(sourceSessionId: state.sourceSessionId);
-        }
-      }
-    });
-
-    _videoViewController!.playbackState.addListener(() {
-      final playing =
-          _videoViewController!.playbackState.value ==
-          VideoControllerPlaybackState.playing;
-      if (!playing) {
-        saveProgress();
-      } else {
-        // Do NOT call _confirmPlaybackStarted() here — ExoPlayer/AVPlayer fires
-        // playbackState=playing when it starts buffering, before any frames arrive.
-        // Confirmation happens via position listener (position > 0).
-      }
-    });
-
-    _videoViewController!.finishedTimes.addListener(() {
-      final completions = _videoViewController!.finishedTimes.value;
-      if (completions > 0) {
-        final isLive =
-            _item.contentType == MultimediaContentType.livestream ||
-            _isLiveStream(_videoUrl);
-        if (isLive && state.currentStream != null) {
           _enterRuntimePhase(
             kind: PlaybackUiPhaseKind.reconnectingLive,
             detail: "Reconnecting to live stream...",
@@ -925,176 +798,43 @@ class PlayerController extends Notifier<PlayerState> {
           changeStream(state.currentStream!, resetPosition: true);
         }
       }
-    });
 
-    _videoViewController!.position.addListener(() {
-      if (!state.useExoPlayer) return;
-
-      final posMs = _videoViewController!.position.value;
-      final durationMs = _videoViewController!.mediaInfo.value?.duration ?? 0;
-
-      if (posMs > 0 && !_hasConfirmedPlaybackFrame) {
-        _confirmPlaybackStarted();
-      }
-
-      if (durationMs == 0) return;
-
-      final currentPct = posMs / durationMs;
-      final lastPct = _lastSavedPosition.inMilliseconds / durationMs;
-
-      if ((currentPct - lastPct).abs() >= _saveThresholdPercent) {
-        saveProgress();
-        _lastSavedPosition = Duration(milliseconds: posMs);
-      }
-
-      if (!_suppressNextEpisodeDetection &&
-          _item.contentType == MultimediaContentType.series) {
-        final remainingSecs = (durationMs - posMs) / 1000;
-        if (remainingSecs <= 15 &&
-            remainingSecs > 0 &&
-            !state.showNextEpisodeOverlay) {
-          int? currentIndex;
-          if (_episode != null) {
-            currentIndex = _item.episodes?.indexWhere(
-              (e) => e.url == _episode!.url,
-            );
+      // Invalid media detection: trigger fallback.
+      // Skip if prepare() is in-flight — it will handle success/failure
+      // itself. Reacting here during prepare causes a race: we set new media
+      // on the player before the old prepare() has returned, which results in
+      // "url open error. elapsed: 25ms" on every subsequent stream attempt.
+      if (newStatus.test(mdk.MediaStatus.invalid) && !_isPreparing) {
+        if (kDebugMode)
+          debugPrint(
+            '[FVP] Stream marked as invalid (post-prepare). Failing over...',
+          );
+        if (!_hasConfirmedPlaybackFrame || _player.position <= 0) {
+          _markSourceAttempt(
+            state.currentStreamIndex,
+            SourceAttemptStatus.failed,
+            isCurrent: false,
+          );
+          if (_manualSelectionPending) {
+            _manualSelectionPending = false;
+            revertToPreviousStream("Selected source failed. Reverting...");
           } else {
-            currentIndex = _item.episodes?.indexWhere(
-              (e) => e.url == _videoUrl,
-            );
+            retryNextStream(sourceSessionId: state.sourceSessionId);
           }
-
-          if (currentIndex != null &&
-              currentIndex != -1 &&
-              currentIndex < _item.episodes!.length - 1) {
-            final next = _item.episodes![currentIndex + 1];
-            state = state.copyWith(
-              showNextEpisodeOverlay: true,
-              nextEpisodeTitle: next.name,
-            );
-          }
-        } else if (remainingSecs > 15 && state.showNextEpisodeOverlay) {
-          state = state.copyWith(showNextEpisodeOverlay: false);
         }
       }
     });
-  }
 
-  void _setupRateListener() {
-    _rateSub?.cancel();
-    _rateSub = _player.stream.rate.listen((rate) {
-      state = state.copyWith(playbackSpeed: rate);
-    });
-  }
+    // Error callback via onEvent (MDK surfaces errors as events).
+    _eventSub = _player.onEvent.listen((event) {
+      if (_isDisposed) return;
+      if (kDebugMode) debugPrint('[FVP] Event: $event');
 
-  void _setupDurationListener() {
-    _durationSub?.cancel();
-    _durationSub = _player.stream.duration.listen((duration) {
-      if (duration > Duration.zero) {
-        if (_pendingResumeSeekPosition != null) {
-          unawaited(_flushPendingResumeSeek());
-        }
-        // Safe point to re-enable next-episode detection: the new episode's
-        // duration is now confirmed, so remaining-time calculations are valid.
-        if (_suppressNextEpisodeDetection) {
-          _suppressNextEpisodeDetection = false;
-        }
-      }
-    });
-  }
+      // MDK error events contain the substring "error" in the event string.
+      final isError = event.toString().toLowerCase().contains('error');
+      if (!isError) return;
 
-  void _setupVideoParamsListener() {
-    // Intentionally empty: videoParams fires as soon as the container is parsed,
-    // before any frames are rendered or position advances. Using it as a
-    // confirmation trigger caused premature overlay dismissal → flickering retries.
-    // Confirmation is handled solely by position > 0 (positionSub) and the
-    // video_view position listener, which are reliable indicators of real playback.
-    _videoParamsSub = _player.stream.videoParams.listen((_) {});
-  }
-
-  void _setupBufferingMonitor() {
-    _bufferingSub?.cancel();
-    _bufferingSub = _player.stream.buffering.listen((isBuffering) {
-      if (isBuffering) {
-        _handleBufferStall();
-        _stallTimer?.cancel();
-        _stallTimer = Timer(const Duration(milliseconds: 200), () {
-          if (_hasConfirmedPlaybackFrame) {
-            _enterRuntimePhase(
-              kind: PlaybackUiPhaseKind.bufferingRuntime,
-              detail: state.isLive
-                  ? "Reconnecting to live stream..."
-                  : "Buffering playback...",
-            );
-          } else {
-            _enterStartupPhase(
-              kind: PlaybackUiPhaseKind.bufferingInitial,
-              detail: state.isLive
-                  ? "Connecting to live stream..."
-                  : "Buffering selected source...",
-              attemptIndex: state.currentAttemptIndex == null
-                  ? null
-                  : state.currentAttemptIndex! + 1,
-              attemptTotal: state.sourceAttempts.isEmpty
-                  ? null
-                  : state.sourceAttempts.length,
-            );
-          }
-        });
-      } else {
-        _stallTimer?.cancel();
-        if (_hasConfirmedPlaybackFrame &&
-            state.uiPhase.kind == PlaybackUiPhaseKind.bufferingRuntime) {
-          _setIdlePhase();
-        }
-      }
-    });
-  }
-
-  void _handleBufferStall() {
-    if (!_hasConfirmedPlaybackFrame) {
-      return; // ignore stalls during source health check
-    }
-    if (_isLiveStream(_videoUrl)) return;
-
-    final now = DateTime.now();
-    _bufferDepletionTimes.add(now);
-
-    // Keep only stalls in the last 60 seconds
-    _bufferDepletionTimes.removeWhere(
-      (t) => now.difference(t) > const Duration(seconds: 60),
-    );
-
-    if (_bufferDepletionTimes.length >= 2 && !state.isAdaptiveBufferingActive) {
-      if (kDebugMode) {
-        debugPrint(
-          "Multiple buffer stalls detected. Activating adaptive buffering.",
-        );
-      }
-      state = state.copyWith(isAdaptiveBufferingActive: true);
-
-      // Re-apply properties with aggressive buffering
-      if (_player.platform is NativePlayer) {
-        final settings = ref.read(playerSettingsProvider).asData?.value;
-        final readahead = (settings?.readaheadSeconds ?? 180) * 2;
-        final native = _player.platform as NativePlayer;
-        // Double the readahead and cache for VOD if stalled
-        if (_player.state.duration > Duration.zero) {
-          native.setProperty('demuxer-readahead-secs', '$readahead');
-          native.setProperty('cache-secs', '$readahead');
-        }
-      }
-    }
-  }
-
-  void _setupErrorListener() {
-    _errorSub = _player.stream.error.listen((error) {
-      if (kDebugMode) debugPrint("Player Error: $error");
-      if (error.toString().toLowerCase().contains("abort")) return;
-
-      if (!_hasConfirmedPlaybackFrame ||
-          _player.state.position == Duration.zero) {
-        // Error before playback confirmed — try next source.
+      if (!_hasConfirmedPlaybackFrame || _player.position <= 0) {
         _markSourceAttempt(
           state.currentStreamIndex,
           SourceAttemptStatus.failed,
@@ -1107,9 +847,8 @@ class PlayerController extends Notifier<PlayerState> {
           retryNextStream(sourceSessionId: state.sourceSessionId);
         }
       } else {
-        // Error during active playback.
         if (state.isLive && state.currentStream != null) {
-          if (_isRecoveringFromStall) return; // watchdog already reconnecting
+          if (_isRecoveringFromStall) return;
           if (kDebugMode) {
             debugPrint("Live stream error. Triggering reconnect...");
           }
@@ -1136,60 +875,51 @@ class PlayerController extends Notifier<PlayerState> {
     });
   }
 
-  void skipLoadingOverlay() {
-    state = state.copyWith(userSkippedOverlay: true);
-    _setUiPhase(
-      _composeUiPhase(kind: state.uiPhase.kind, fullscreenBlocking: false),
-    );
-  }
+  /// 250ms polling timer that syncs FVP's synchronous position/duration
+  /// getters into the reactive PlayerState.
+  void _startPositionPolling() {
+    _positionTimer?.cancel();
+    _positionTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (_isDisposed) return;
 
-  void _setupEventDrivenProgressSaving() {
-    _playingSub?.cancel();
-    _playingSub = _player.stream.playing.listen((isPlaying) {
-      if (!isPlaying) {
-        saveProgress();
-        _torrentPollTimer?.cancel();
-        _torrentPollTimer = null;
-      } else {
-        // Do NOT call _confirmPlaybackStarted() here — media_kit fires
-        // playing=true as soon as open() is called, before any frames arrive.
-        // Confirmation happens in _positionSub (position > 0) and
-        // _setupVideoParamsListener (video dimensions received).
-        if (state.torrentStatus != null && _torrentPollTimer == null) {
-          startTorrentPolling();
-        }
+      final posMs = _player.position;
+      final durMs = _player.mediaInfo.duration;
+      final pos = Duration(milliseconds: posMs);
+      final dur = Duration(milliseconds: durMs);
+      final bufMs = _player.buffered();
+      final buf = Duration(milliseconds: bufMs);
+
+      final video = _player.mediaInfo.video;
+      int vw = 0;
+      int vh = 0;
+      if (video != null && video.isNotEmpty) {
+        vw = video[0].codec.width;
+        vh = video[0].codec.height;
       }
-    });
 
-    _completedSub?.cancel();
-    _completedSub = _player.stream.completed.listen((isCompleted) {
-      if (isCompleted) {
-        final isLive =
-            _item.contentType == MultimediaContentType.livestream ||
-            _isLiveStream(_videoUrl);
-        if (isLive && state.currentStream != null) {
-          if (kDebugMode) {
-            debugPrint("Live stream reached EOF. Forcing auto-reconnect...");
-          }
-          _enterRuntimePhase(
-            kind: PlaybackUiPhaseKind.reconnectingLive,
-            detail: "Reconnecting to live stream...",
-          );
-          changeStream(state.currentStream!, resetPosition: true);
-        }
-      }
-    });
+      state = state.copyWith(
+        position: pos,
+        duration: dur,
+        buffer: buf,
+        videoWidth: vw,
+        videoHeight: vh,
+      );
 
-    _positionSub?.cancel();
-    _positionSub = _player.stream.position.listen((pos) {
-      if (pos.inMilliseconds > 0 && !_hasConfirmedPlaybackFrame) {
+      if (posMs > 0 && !_hasConfirmedPlaybackFrame) {
         _confirmPlaybackStarted();
       }
 
-      final now = DateTime.now();
+      if (durMs > 0 && _pendingResumeSeekPosition != null) {
+        unawaited(_flushPendingResumeSeek());
+      }
 
-      // --- Stall Watchdog Logic ---
-      if (_player.state.playing && !state.isBuffering && !state.isLoading) {
+      if (durMs > 0 && _suppressNextEpisodeDetection) {
+        _suppressNextEpisodeDetection = false;
+      }
+
+      // --- Stall Watchdog ---
+      final now = DateTime.now();
+      if (state.isPlaying && !state.isBuffering && !state.isLoading) {
         if (_lastPosition != null && _lastPosition == pos) {
           final stallDuration = _lastPositionUpdateTime != null
               ? now.difference(_lastPositionUpdateTime!)
@@ -1197,23 +927,18 @@ class PlayerController extends Notifier<PlayerState> {
 
           if (stallDuration.inSeconds >= 5 && !_isRecoveringFromStall) {
             if (kDebugMode) {
-              debugPrint(
-                "Watchdog: Silent stall detected (5s). Kicking engine...",
-              );
+              debugPrint("Watchdog: Silent stall (5s). Kicking engine...");
             }
             _isRecoveringFromStall = true;
 
-            // Recovery: reconnect live streams from scratch; kick VOD.
             if (state.isLive && state.currentStream != null) {
               changeStream(state.currentStream!, resetPosition: true);
             } else {
-              _player.play();
+              _player.state = mdk.PlaybackState.playing;
+              Future.delayed(const Duration(seconds: 10), () {
+                _isRecoveringFromStall = false;
+              });
             }
-
-            // prevent multi-trigger
-            Future.delayed(const Duration(seconds: 10), () {
-              _isRecoveringFromStall = false;
-            });
           }
         } else {
           _lastPosition = pos;
@@ -1223,28 +948,24 @@ class PlayerController extends Notifier<PlayerState> {
         _lastPosition = pos;
         _lastPositionUpdateTime = now;
       }
-      // -----------------------------
 
-      final duration = _player.state.duration;
-      if (duration == Duration.zero) return;
-
-      final currentPct = pos.inMilliseconds / duration.inMilliseconds;
-      final lastPct =
-          _lastSavedPosition.inMilliseconds / duration.inMilliseconds;
+      // --- Progress Saving ---
+      if (durMs == 0) return;
+      final currentPct = posMs / durMs;
+      final lastPct = _lastSavedPosition.inMilliseconds / durMs;
 
       if ((currentPct - lastPct).abs() >= _saveThresholdPercent) {
         saveProgress();
         _lastSavedPosition = pos;
       }
 
-      // Next Episode Detection (Series only, trigger 15s before end)
+      // --- Next Episode Detection (15s before end) ---
       if (!_suppressNextEpisodeDetection &&
           _item.contentType == MultimediaContentType.series) {
-        final remaining = duration - pos;
+        final remaining = dur - pos;
         if (remaining.inSeconds <= 15 &&
             remaining.inSeconds > 0 &&
             !state.showNextEpisodeOverlay) {
-          // Use _episode if available, otherwise fallback to URL matching
           int? currentIndex;
           if (_episode != null) {
             currentIndex = _item.episodes?.indexWhere(
@@ -1270,6 +991,23 @@ class PlayerController extends Notifier<PlayerState> {
         }
       }
     });
+  }
+
+  void _handleBufferStall() {
+    if (!_hasConfirmedPlaybackFrame) return;
+    if (_isLiveStream(_videoUrl)) return;
+
+    final now = DateTime.now();
+    _bufferDepletionTimes.add(now);
+    _bufferDepletionTimes.removeWhere(
+      (t) => now.difference(t) > const Duration(seconds: 60),
+    );
+
+    if (_bufferDepletionTimes.length >= 2 && !state.isAdaptiveBufferingActive) {
+      if (kDebugMode) {
+        debugPrint("Multiple buffer stalls. Activating adaptive buffering.");
+      }
+    }
   }
 
   Future<void> _initStream({
@@ -1519,22 +1257,6 @@ class PlayerController extends Notifier<PlayerState> {
     return merged;
   }
 
-  List<SubtitleTrackConfig> _buildSubtitleConfigs(
-    List<SubtitleFile> subtitles,
-  ) {
-    return subtitles
-        .map(
-          (subtitle) => SubtitleTrackConfig(
-            uri: subtitle.url,
-            mimeType: subtitle.url.toLowerCase().endsWith('.vtt')
-                ? 'text/vtt'
-                : 'application/x-subrip',
-            language: subtitle.lang ?? 'und',
-          ),
-        )
-        .toList();
-  }
-
   String _languageName(String code) {
     return code.trim();
   }
@@ -1603,123 +1325,85 @@ class PlayerController extends Notifier<PlayerState> {
   Future<void> _openResolvedStream(
     String playUrl,
     StreamResult stream,
-    Map<String, String> headers, {
-    required bool useVideoView,
-  }) async {
-    if (useVideoView) {
-      // Pause media_kit so it stops consuming bandwidth while video_view plays.
-      // (media_kit.open() will replace it if the user switches back.)
-      if (!state.useExoPlayer) {
-        await _player.pause();
-      }
+    Map<String, String> headers,
+  ) async {
+    String finalUrl = playUrl;
+    if (kDebugMode) {
+      debugPrint("[PLAYER] _openResolvedStream input: $playUrl");
+      debugPrint("[PLAYER] _openResolvedStream headers: $headers");
+    }
+    _player.media = finalUrl.trim();
 
-      String finalUrl = playUrl;
-      if (finalUrl.contains('play.php') || finalUrl.contains('index.php')) {
-        finalUrl = LocalProxyService.instance.getProxyUrl(
-          finalUrl,
-          headers: headers,
-          forceM3u8Extension: true,
-        );
-        if (kDebugMode) {
-          debugPrint("[PLAYER] Proxied non-standard HLS: $finalUrl");
-        }
-      }
+    // Yield to the event loop so MDK's C++ thread can process the stop/reset
+    // commands that setting media enqueues. Those stops fire AFTER this Dart
+    // frame and can clear AVIOContext properties set before them.
+    // A microtask delay ensures they complete before we write headers.
+    await Future.delayed(Duration.zero);
 
-      if (Platform.isWindows) {
-        final scheme = Uri.tryParse(finalUrl)?.scheme ?? '';
-        final lowerUrl = finalUrl.toLowerCase();
-        final hasAdaptiveExtension = lowerUrl.contains('.m3u8') ||
-            lowerUrl.contains('.mpd') ||
-            lowerUrl.contains('.ism/manifest');
-        if (hasAdaptiveExtension &&
-            scheme != 'http' &&
-            scheme != 'https' &&
-            scheme != 'file') {
-          throw Exception(
-            'Unsupported URL scheme "$scheme" for native adaptive player on Windows',
-          );
-        }
+    // Inject HTTP headers AFTER MDK's internal stops have flushed.
+    // Set at both avio (initial m3u8 connection) and avformat (HLS segment
+    // connections) levels so the Referer reaches every HTTP request.
+    if (headers.isNotEmpty) {
+      String headerFields = '';
+      headers.forEach((key, value) {
+        headerFields += '$key: $value\r\n';
+      });
+      if (kDebugMode) {
+        debugPrint('[PLAYER] Setting avio.headers (post-stop): $headerFields');
       }
-
-      final subs = state.externalSubtitles;
-      if (subs.isNotEmpty && _videoViewSupportsMergedExternalSubtitles) {
-        _videoViewController!.openWithSubtitles(
-          finalUrl,
-          headers: headers,
-          subtitles: _buildSubtitleConfigs(subs),
-          drmKey: stream.drmKey,
-          drmKid: stream.drmKid,
-        );
-      } else {
-        _videoViewController!.open(
-          finalUrl,
-          headers: headers,
-          drmKey: stream.drmKey,
-          drmKid: stream.drmKid,
-        );
-      }
-      state = state.copyWith(useExoPlayer: true, isSeekable: false);
-      return;
+      _player.setProperty('avio.headers', headerFields);
+      _player.setProperty('avformat.headers', headerFields);
     }
 
-    // Close video_view before handing off to media_kit so ExoPlayer/AVPlayer
-    // stops buffering and releases its surface while media_kit plays.
-    if (state.useExoPlayer) {
-      _videoViewController?.close();
+    try {
+      // Set _isPreparing BEFORE awaiting prepare() so the status callback
+      // knows not to trigger a premature failover during this window.
+      _isPreparing = true;
+      final result = await _player.prepare();
+      _isPreparing = false;
+      if (kDebugMode) {
+        debugPrint("[FVP] Prepare result: $result");
+      }
+      if (result < 0) {
+        throw Exception("MDK prepare failed with code $result");
+      }
+      _player.state = mdk.PlaybackState.playing;
+    } catch (e) {
+      _isPreparing = false;
+      if (kDebugMode) {
+        debugPrint("[FVP] Failed to open/prepare media: $e");
+      }
+      throw Exception("Failed to open media: $finalUrl");
     }
 
-    await _player.open(Media(playUrl, httpHeaders: headers));
-    state = state.copyWith(useExoPlayer: false, isSeekable: true);
+    // updateTexture() can optionally be called, but wait to ensure texture is ready.
+    // It's safe to call here as FVP handles async rendering.
+    _player.updateTexture();
   }
 
   Future<void> seekTo(Duration position, {bool fast = false}) async {
     if (!state.canSeek) return;
-
     final clamped = position < Duration.zero ? Duration.zero : position;
-
-    if (state.useExoPlayer && _videoViewController != null) {
-      _videoViewController!.seekTo(clamped.inMilliseconds, fast: fast);
-      return;
-    }
-
-    await _player.seek(clamped);
+    // FVP seek is synchronous and takes milliseconds.
+    _player.seek(position: clamped.inMilliseconds);
   }
 
   Future<void> seekRelative(Duration amount, {bool fast = false}) async {
     if (!state.canSeek) return;
-
-    final currentPosition = state.useExoPlayer
-        ? Duration(milliseconds: _videoViewController?.position.value ?? 0)
-        : _player.state.position;
-
+    final currentPosition = state.position;
     await seekTo(currentPosition + amount, fast: fast);
   }
 
   Future<void> play() async {
-    if (state.useExoPlayer && _videoViewController != null) {
-      _videoViewController!.play();
-      return;
-    }
-
-    await _player.play();
+    _player.state = mdk.PlaybackState.playing;
   }
 
   Future<void> pause() async {
-    if (state.useExoPlayer && _videoViewController != null) {
-      _videoViewController!.pause();
-      return;
-    }
-
-    await _player.pause();
+    _player.state = mdk.PlaybackState.paused;
   }
 
   Future<void> togglePlayPause() async {
-    final isPlaying = state.useExoPlayer && _videoViewController != null
-        ? _videoViewController!.playbackState.value ==
-              VideoControllerPlaybackState.playing
-        : _player.state.playing;
-
-    if (isPlaying) {
+    if (state.isPlaying) {
       await pause();
     } else {
       await play();
@@ -1727,135 +1411,84 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   PlayerTrackSelectionSnapshot getTrackSelectionSnapshot() {
-    if (state.useExoPlayer && _videoViewController != null) {
-      final controller = _videoViewController!;
-      final info = controller.mediaInfo.value;
-      if (info == null) {
-        return const PlayerTrackSelectionSnapshot();
-      }
+    final audioTracks = <PlayerTrackOption>[];
+    final subtitleTracks = <PlayerTrackOption>[];
 
-      final overrideAudio = controller.overrideAudio.value;
-      final overrideSubtitle = controller.overrideSubtitle.value;
-      final showSubtitle = controller.showSubtitle.value;
+    final activeAudio = _player.activeAudioTracks;
+    final activeSubtitle = _player.activeSubtitleTracks;
 
-      final audioTracks = info.audioTracks.entries
-          .map(
-            (entry) => PlayerTrackOption(
-              id: entry.key,
-              label: _formatTrackLabel(
-                language: entry.value.language,
-                title: entry.value.title,
-                fallbackId: entry.key,
-              ),
-              subtitle: entry.value.format,
-              selected:
-                  overrideAudio == entry.key ||
-                  (overrideAudio == null && info.audioTracks.length == 1),
-            ),
-          )
-          .toList();
-
-      final subtitleTracks = info.subtitleTracks.entries
-          .map(
-            (entry) => PlayerTrackOption(
-              id: entry.key,
-              label: _formatTrackLabel(
-                language: entry.value.language,
-                title: entry.value.title,
-                fallbackId: entry.key,
-              ),
-              subtitle: entry.value.format,
-              selected: showSubtitle && overrideSubtitle == entry.key,
-            ),
-          )
-          .toList();
-
-      return PlayerTrackSelectionSnapshot(
-        audioTracks: audioTracks,
-        subtitleTracks: subtitleTracks,
-        subtitlesOffSelected: !showSubtitle,
-      );
-    }
-
-    final audioTracks = _player.state.tracks.audio
-        .map(
-          (track) => PlayerTrackOption(
-            id: track.id,
-            label: _formatTrackLabel(
-              language: track.language,
-              title: track.title,
-              fallbackId: track.id,
-            ),
-            subtitle: _formatTechnicalSubtitle(track),
-            selected: track == _player.state.track.audio,
-          ),
-        )
-        .toList();
-
-    final subtitleTracks = <PlayerTrackOption>[
-      ...state.externalSubtitles.map(
-        (subtitle) => PlayerTrackOption(
+    // External subtitles
+    // Since FVP setMedia(url, MediaType.subtitle) overrides the track, we
+    // handle external subtitle state selection by tracking it.
+    // MDK allows 1 external subtitle. It's usually assigned an index, or we just rely on state if needed.
+    // For simplicity, we just add them to the list.
+    for (final subtitle in state.externalSubtitles) {
+      subtitleTracks.add(
+        PlayerTrackOption(
           id: 'external:${subtitle.url}',
           label: subtitle.label,
           subtitle: subtitle.lang != null
               ? _languageName(subtitle.lang!)
               : null,
           selected:
-              _player.state.track.subtitle.id == subtitle.url ||
-              _player.state.track.subtitle.id == 'external:${subtitle.url}',
+              false, // FVP external track state check requires custom tracking if multiple externals.
         ),
-      ),
-      ..._player.state.tracks.subtitle.map(
-        (track) => PlayerTrackOption(
-          id: track.id,
-          label: _formatTrackLabel(
-            language: track.language,
-            title: track.title,
-            fallbackId: track.id,
+      );
+    }
+
+    final mediaInfo = _player.mediaInfo;
+    if (mediaInfo.audio != null) {
+      for (final track in mediaInfo.audio!) {
+        audioTracks.add(
+          PlayerTrackOption(
+            id: track.index.toString(),
+            label: _formatTrackLabel(
+              language:
+                  track.metadata['language'] ?? track.metadata['language'],
+              title: track.metadata['title'],
+              fallbackId: track.index.toString(),
+            ),
+            subtitle:
+                'Audio', // We skip codec details as they require extra MDK type parsing
+            selected: activeAudio.contains(track.index),
           ),
-          selected: track == _player.state.track.subtitle,
+        );
+      }
+    }
+
+    if (mediaInfo.subtitle != null) {
+      subtitleTracks.addAll(
+        mediaInfo.subtitle!.map(
+          (track) => PlayerTrackOption(
+            id: track.index.toString(),
+            label: _formatTrackLabel(
+              language: track.metadata['language'],
+              title: track.metadata['title'],
+              fallbackId: track.index.toString(),
+            ),
+            selected: activeSubtitle.contains(track.index),
+          ),
         ),
-      ),
-    ];
+      );
+    }
 
     return PlayerTrackSelectionSnapshot(
       audioTracks: audioTracks,
       subtitleTracks: subtitleTracks,
-      subtitlesOffSelected: _player.state.track.subtitle == SubtitleTrack.no(),
+      subtitlesOffSelected: activeSubtitle.isEmpty,
     );
   }
 
   Future<void> selectAudioTrack(String id) async {
-    if (state.useExoPlayer && _videoViewController != null) {
-      _videoViewController!.setOverrideAudio(id);
-      return;
-    }
-
-    final track = _player.state.tracks.audio.firstWhereOrNull(
-      (t) => t.id == id,
-    );
-    if (track != null) {
-      await _player.setAudioTrack(track);
+    final index = int.tryParse(id);
+    if (index != null) {
+      _player.setActiveTracks(mdk.MediaType.audio, [index]);
     }
   }
 
   Future<void> selectSubtitleTrack(String? id) async {
-    if (state.useExoPlayer && _videoViewController != null) {
-      if (id == null) {
-        _videoViewController!.setShowSubtitle(false);
-        if (_videoViewController!.overrideSubtitle.value != null) {
-          _videoViewController!.setOverrideSubtitle(null);
-        }
-        return;
-      }
-
-      _videoViewController!.setShowSubtitle(true);
-      _videoViewController!.setOverrideSubtitle(id);
-      return;
-    }
-
     if (id == null) {
-      await _player.setSubtitleTrack(SubtitleTrack.no());
+      _player.setActiveTracks(mdk.MediaType.subtitle, []);
       return;
     }
 
@@ -1865,13 +1498,7 @@ class PlayerController extends Notifier<PlayerState> {
         (sub) => sub.url == url,
       );
       if (subtitle != null) {
-        await _player.setSubtitleTrack(
-          SubtitleTrack.uri(
-            subtitle.url,
-            title: subtitle.label,
-            language: subtitle.lang,
-          ),
-        );
+        _player.setMedia(subtitle.url, mdk.MediaType.subtitle);
       }
       return;
     }
@@ -1879,11 +1506,10 @@ class PlayerController extends Notifier<PlayerState> {
     final embeddedId = id.startsWith('embedded:')
         ? id.substring('embedded:'.length)
         : id;
-    final track = _player.state.tracks.subtitle.firstWhereOrNull(
-      (t) => t.id == embeddedId,
-    );
-    if (track != null) {
-      await _player.setSubtitleTrack(track);
+
+    final index = int.tryParse(embeddedId);
+    if (index != null) {
+      _player.setActiveTracks(mdk.MediaType.subtitle, [index]);
     }
   }
 
@@ -1936,9 +1562,7 @@ class PlayerController extends Notifier<PlayerState> {
 
     final stream = state.streams[index];
     final rawProviderName =
-        _item.provider ??
-        ref.read(activeProviderProvider)?.name ??
-        "Unknown";
+        _item.provider ?? ref.read(activeProviderProvider)?.name ?? "Unknown";
     final providerName = _getProviderDisplayName(rawProviderName);
     final subtitles = _effectiveExternalSubtitles(stream.subtitles);
     final attemptTotal = state.sourceAttempts.isEmpty
@@ -2003,11 +1627,6 @@ class PlayerController extends Notifier<PlayerState> {
       }
 
       final resolvedIsLive = _detectResolvedLiveState(playUrl);
-      final useVideoView = _canUseVideoViewForStream(
-        playUrl,
-        stream,
-        isLive: resolvedIsLive,
-      );
       if (sourceSessionId != null &&
           !_isCurrentSourceSession(sourceSessionId)) {
         return;
@@ -2015,31 +1634,16 @@ class PlayerController extends Notifier<PlayerState> {
       state = state.copyWith(
         streamSubtitle: "$providerName - ${stream.source}",
         isLive: resolvedIsLive,
-        isSeekable: !useVideoView,
+        isSeekable: true,
       );
-      if (state.useExoPlayer != useVideoView && _hasConfirmedPlaybackFrame) {
-        _enterRuntimePhase(
-          kind: PlaybackUiPhaseKind.switchingEngine,
-          detail: "Optimizing playback...",
-        );
-      }
 
       final headers = stream.headers ?? {};
-      await _applyPlaybackProperties(
-        headers,
-        stream,
-        useVideoView: useVideoView,
-      );
+      await _applyPlaybackProperties(headers, stream);
       if (sourceSessionId != null &&
           !_isCurrentSourceSession(sourceSessionId)) {
         return;
       }
-      await _openResolvedStream(
-        playUrl,
-        stream,
-        headers,
-        useVideoView: useVideoView,
-      );
+      await _openResolvedStream(playUrl, stream, headers);
       if (sourceSessionId != null &&
           !_isCurrentSourceSession(sourceSessionId)) {
         return;
@@ -2093,6 +1697,11 @@ class PlayerController extends Notifier<PlayerState> {
     }
   }
 
+  void skipLoadingOverlay() {
+    _hasConfirmedPlaybackFrame = true;
+    _setIdlePhase();
+  }
+
   /// Called when the user taps "Resume" in the resume prompt overlay.
   Future<void> confirmResume() async {
     final pos = state.resumePromptPosition;
@@ -2113,11 +1722,7 @@ class PlayerController extends Notifier<PlayerState> {
   /// known duration; for pure live streams, forces a full reconnect.
   Future<void> goLive() async {
     if (!state.isLive || state.currentStream == null) return;
-    final dur = state.useExoPlayer
-        ? Duration(
-            milliseconds: _videoViewController?.mediaInfo.value?.duration ?? 0,
-          )
-        : _player.state.duration;
+    final dur = state.duration;
     if (dur > Duration.zero) {
       await seekTo(dur);
     } else {
@@ -2155,16 +1760,12 @@ class PlayerController extends Notifier<PlayerState> {
     }
 
     final rawPName =
-        _item.provider ??
-        ref.read(activeProviderProvider)?.name ??
-        'Unknown';
+        _item.provider ?? ref.read(activeProviderProvider)?.name ?? 'Unknown';
     final pName = _getProviderDisplayName(rawPName);
 
     // Capture current position before we switch engines/streams.
     // Read from whichever engine is currently active.
-    final oldPos = state.useExoPlayer
-        ? Duration(milliseconds: _videoViewController?.position.value ?? 0)
-        : _player.state.position;
+    final oldPos = state.position;
 
     _enterRuntimePhase(
       kind: PlaybackUiPhaseKind.switchingSource,
@@ -2177,22 +1778,11 @@ class PlayerController extends Notifier<PlayerState> {
       final subtitles = _effectiveExternalSubtitles(stream.subtitles);
 
       final resolvedIsLive = _detectResolvedLiveState(playUrl);
-      final useVideoView = _canUseVideoViewForStream(
-        playUrl,
-        stream,
-        isLive: resolvedIsLive,
-      );
-      if (state.useExoPlayer != useVideoView && _hasConfirmedPlaybackFrame) {
-        _enterRuntimePhase(
-          kind: PlaybackUiPhaseKind.switchingEngine,
-          detail: "Optimizing playback...",
-        );
-      }
       state = state.copyWith(
         currentStream: stream,
         externalSubtitles: subtitles,
         isLive: resolvedIsLive,
-        isSeekable: !useVideoView,
+        isSeekable: true,
         streamSubtitle: "$pName - ${stream.source}",
       );
 
@@ -2203,17 +1793,8 @@ class PlayerController extends Notifier<PlayerState> {
       }
 
       final headers = stream.headers ?? {};
-      await _applyPlaybackProperties(
-        headers,
-        stream,
-        useVideoView: useVideoView,
-      );
-      await _openResolvedStream(
-        playUrl,
-        stream,
-        headers,
-        useVideoView: useVideoView,
-      );
+      await _applyPlaybackProperties(headers, stream);
+      await _openResolvedStream(playUrl, stream, headers);
 
       if (oldPos > Duration.zero && !resetPosition) {
         await _safeSeekTo(oldPos.inMilliseconds);
@@ -2501,16 +2082,8 @@ class PlayerController extends Notifier<PlayerState> {
 
   void saveProgress() {
     try {
-      // Read position/duration from whichever engine is currently active.
-      final int pos;
-      final int dur;
-      if (state.useExoPlayer && _videoViewController != null) {
-        pos = _videoViewController!.position.value;
-        dur = _videoViewController!.mediaInfo.value?.duration ?? 0;
-      } else {
-        pos = _player.state.position.inMilliseconds;
-        dur = _player.state.duration.inMilliseconds;
-      }
+      final int pos = state.position.inMilliseconds;
+      final int dur = state.duration.inMilliseconds;
       final isLivestream =
           _item.contentType == MultimediaContentType.livestream;
 
@@ -2661,15 +2234,9 @@ class PlayerController extends Notifier<PlayerState> {
     _stallTimer?.cancel();
     _stallTimer = null;
 
-    _videoParamsSub?.cancel();
-    _errorSub?.cancel();
-    _playingSub?.cancel();
-    _positionSub?.cancel();
-    _durationSub?.cancel();
-    _bufferingSub?.cancel();
-    _completedSub?.cancel();
-    _rateSub?.cancel();
-    _logSub?.cancel();
+    _stateSub?.cancel();
+    _statusSub?.cancel();
+    _eventSub?.cancel();
 
     saveProgress();
     ref.read(torrentServiceProvider).stop();
@@ -2819,9 +2386,8 @@ class PlayerController extends Notifier<PlayerState> {
   /// Applies per-playback MPV properties (headers, cookies, DRM).
   Future<void> _applyPlaybackProperties(
     Map<String, String> headers,
-    StreamResult stream, {
-    required bool useVideoView,
-  }) async {
+    StreamResult stream,
+  ) async {
     // Debug: log what DRM fields the stream has so failures are traceable.
     if (kDebugMode) {
       debugPrint(
@@ -2831,185 +2397,51 @@ class PlayerController extends Notifier<PlayerState> {
       );
     }
 
-    if (_player.platform is NativePlayer) {
-      final native = _player.platform as NativePlayer;
+    // Ensure we have a default User-Agent if none provided (many servers require it)
+    if (!headers.keys.any((k) => k.toLowerCase() == 'user-agent')) {
+      headers['User-Agent'] =
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    }
 
-      final lowerHeaders = headers.map((k, v) => MapEntry(k.toLowerCase(), v));
+    // NOTE: avio.headers is applied in _openResolvedStream, right after
+    // player.media is set, to avoid MDK clearing properties on media change.
 
-      // Propagate ALL provided headers to MPV (Critical for cookies/auth)
-      if (lowerHeaders.isNotEmpty) {
-        final List<String> headerFields = [];
-        lowerHeaders.forEach((key, value) {
-          // FFmpeg/libavformat "headers" option standard is CRLF terminated strings.
-          // Comma-separated list is also accepted by MPV but CRLF is more robust.
-          headerFields.add('$key: $value');
-        });
+    // Apply the same AVFormat/AVio properties that FVP sets on every player.
+    // These are critical for HLS over HTTPS to work — without them FFmpeg's
+    // HLS demuxer applies strict URL safety checks and refuses segment URLs.
+    _player.setProperty('avformat.strict', 'experimental');
+    _player.setProperty('avformat.safe', '0');
+    _player.setProperty('avio.reconnect', '1');
+    _player.setProperty('avio.reconnect_delay_max', '7');
+    _player.setProperty('avformat.rtsp_transport', 'tcp');
+    _player.setProperty('avformat.extension_picky', '0');
+    _player.setProperty('avformat.allowed_segment_extensions', 'ALL');
+    _player.setProperty(
+      'avio.protocol_whitelist',
+      'file,http,https,tls,tcp,udp,crypto,data,concat,subfile',
+    );
 
-        if (headerFields.isNotEmpty) {
-          // Join with \r\n and ensure it ends with \r\n
-          final fields = '${headerFields.join('\r\n')}\r\n';
-          if (kDebugMode) {
-            debugPrint('Player: Setting http-header-fields: $fields');
-          }
-          await native.setProperty('http-header-fields', fields);
-        }
+    // Hardware decoders: platform-appropriate priority list
+    _player.videoDecoders = ['VT', 'D3D11', 'AMediaCodec', 'ffmpeg'];
+
+    // 2. Resolve ClearKey Hex Keys
+    String? keyHex = stream.drmKey;
+
+    if (keyHex == null && stream.licenseUrl != null) {
+      final extractedKeys = await _extractKeysFromLicenseUrl(
+        stream.licenseUrl!,
+        headers: stream.headers,
+      );
+      if (extractedKeys != null) {
+        keyHex = extractedKeys['key'];
       }
+    }
 
-      // Also set dedicated properties for better compatibility
-      if (lowerHeaders.containsKey('user-agent')) {
-        await native.setProperty('user-agent', lowerHeaders['user-agent']!);
-      }
-      if (lowerHeaders.containsKey('referer')) {
-        await native.setProperty('referrer', lowerHeaders['referer']!);
-      }
-
-      // 0. Hardware decoding preference
-      // Use auto-safe on Windows: 'auto' enables D3D11VA which can crash during
-      // DASH manifest negotiation before codec parameters are fully known.
-      final settings = ref.read(playerSettingsProvider).asData?.value;
-      if (settings?.hardwareDecoding ?? true) {
-        await native.setProperty(
-          'hwdec',
-          Platform.isWindows ? 'auto-safe' : 'auto',
-        );
-      } else {
-        await native.setProperty('hwdec', 'no');
-      }
-
-      // 1. Performance tuning & Anti-Looping
-      await native.setProperty('cache', 'yes');
-
-      // Accumulates demuxer-lavf-o options; applied as one combined call below
-      // to prevent later additions (e.g. DRM key) from silently overwriting
-      // earlier ones (e.g. live reconnect seg_max_retry).
-      final demuxerLavfOpts = <String>[];
-
-      final isLivePattern =
-          _isLiveStream(stream.url) ||
-          _item.contentType == MultimediaContentType.livestream;
+    if (keyHex != null) {
       if (kDebugMode) {
-        debugPrint(
-          'Stream Type (isLivePattern): $isLivePattern, URL: ${stream.url}',
-        );
+        debugPrint('[DRM] Injecting cenc_decryption_key: $keyHex');
       }
-      if (isLivePattern) {
-        // Live TV: small buffer to absorb network jitter, not the large VOD buffer
-        await native.setProperty('demuxer-readahead-secs', '8');
-        await native.setProperty('cache-secs', '8');
-        await native.setProperty('cache', 'yes');
-        await native.setProperty('cache-pause-initial', 'yes');
-        await native.setProperty('cache-pause-wait', '2');
-
-        // Network
-        await native.setProperty('network-timeout', '30');
-        await native.setProperty('tls-verify', 'no');
-
-        // Reconnect
-        await native.setProperty(
-          'stream-lavf-o',
-          'reconnect_on_network_error=1,reconnect_delay_max=5,reconnect_on_eof=1,reconnect_streamed=1',
-        );
-
-        // HLS/DASH segment retry — collected for combined application below.
-        demuxerLavfOpts.add('seg_max_retry=5');
-
-        // Playback
-        await native.setProperty('framedrop', 'decoder');
-        await native.setProperty('hr-seek-framedrop', 'yes');
-        await native.setProperty('hwdec', 'auto-safe');
-
-        // H.264 resilience: wait for clean keyframe after reconnect
-        await native.setProperty('vd-lavc-skiploopfilter', 'nonkey');
-        await native.setProperty('vd-lavc-skipframe', 'nonref');
-
-        if (kDebugMode && _logSub == null) {
-          _logSub = _player.stream.log.listen((log) {
-            debugPrint('[MPV] ${log.level}: ${log.text}');
-          });
-        }
-      } else {
-        final settings = ref.read(playerSettingsProvider).asData?.value;
-        final readahead = settings?.readaheadSeconds ?? 180;
-        await native.setProperty('demuxer-readahead-secs', '$readahead');
-        await native.setProperty('cache-secs', '$readahead');
-        await native.setProperty('cache', 'yes');
-      }
-
-      // Adaptive demuxer cache based on device profile.
-      // DASH streams on desktop are capped lower to prevent OOM from aggressive
-      // segment pre-fetch combined with high-bitrate representations.
-      final profile = ref.read(deviceProfileProvider).asData?.value;
-      final isDashStream = _isDashStreamUrl(stream.url);
-      String cacheSize = "512MiB"; // Default
-      if (profile != null) {
-        if (profile.isTv) {
-          cacheSize = "128MiB"; // Less RAM on TVs
-        } else if (profile.isDesktopOS || profile.isTablet) {
-          cacheSize = isDashStream ? "256MiB" : "1GiB";
-        }
-      }
-
-      await native.setProperty('demuxer-max-bytes', cacheSize);
-      // Allow seeking back without re-fetching — proportional to device RAM
-      final backCacheSize = profile?.isTv == true
-          ? '64MiB'
-          : (profile?.isDesktopOS == true || profile?.isTablet == true)
-          ? '256MiB'
-          : '128MiB';
-      await native.setProperty('demuxer-max-back-bytes', backCacheSize);
-
-      // 2. Resolve ClearKey Hex Keys
-      String? keyHex = stream.drmKey;
-
-      if (keyHex == null && stream.licenseUrl != null) {
-        final extractedKeys = await _extractKeysFromLicenseUrl(
-          stream.licenseUrl!,
-          headers: stream.headers,
-        );
-        if (extractedKeys != null) {
-          keyHex = extractedKeys['key'];
-        }
-      }
-
-      if (keyHex != null) {
-        // FFmpeg's DASH demuxer natively expects cenc_decryption_key.
-        // It's usually the 32-character hex KEY.
-        if (kDebugMode) {
-          debugPrint(
-            '[DRM] Injecting cenc_decryption_key via demuxer-lavf-o: $keyHex',
-          );
-        }
-
-        if (!useVideoView) {
-          // Collected into demuxerLavfOpts and applied below to prevent
-          // overwriting live reconnect options (seg_max_retry) set earlier.
-          demuxerLavfOpts.add('cenc_decryption_key=$keyHex');
-        } else {
-          // If using VideoView on Android, we'd pass DRM keys to the native side here.
-        }
-      }
-
-      // 3. Apply all demuxer-lavf-o options in a single combined call.
-      //    Multiple setProperty('demuxer-lavf-o', ...) calls overwrite each
-      //    other; joining here ensures live and DRM settings coexist.
-      if (demuxerLavfOpts.isNotEmpty) {
-        await native.setProperty('demuxer-lavf-o', demuxerLavfOpts.join(','));
-      }
-
-      try {
-        final tempDir = await getTemporaryDirectory();
-        // Use p.join to produce a platform-correct path; on Windows the mixed
-        // forward/back-slash path produced by string concatenation can confuse
-        // libmpv's internal path parser.
-        final cookieFile = File(p.join(tempDir.path, 'mpv_cookies.txt'));
-        if (!await cookieFile.exists()) {
-          await cookieFile.create();
-        }
-        await native.setProperty('cookies-file', cookieFile.path);
-        // Note: 'cookies-file-access' is not a valid MPV property and is omitted.
-      } catch (e) {
-        if (kDebugMode) debugPrint('Failed to set cookies-file: $e');
-      }
+      _player.setProperty('avformat.cenc_decryption_key', keyHex);
     }
   }
 
@@ -3062,18 +2494,22 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   /// Converts a Base64url-encoded string to a lowercase hex string.
-  String? _base64UrlToHex(String base64url) {
+  String? _base64UrlToHex(String input) {
     try {
-      // Add padding if needed.
-      String padded = base64url;
-      final rem = padded.length % 4;
-      if (rem == 2) padded += '==';
-      if (rem == 3) padded += '=';
-      final bytes = base64Url.decode(padded);
+      final cleaned = input.replaceAll(RegExp(r'\s+'), '');
+      // Check if already hex (32 chars for 16 bytes)
+      if (RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(cleaned)) {
+        return cleaned.toLowerCase();
+      }
+
+      // Add padding for Base64Url
+      String b64 = cleaned.replaceAll('-', '+').replaceAll('_', '/');
+      while (b64.length % 4 != 0) b64 += '=';
+      final bytes = base64.decode(b64);
       return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     } catch (e) {
       if (kDebugMode) {
-        debugPrint('[DRM] base64url decode failed for "$base64url": $e');
+        debugPrint('[DRM] encoding decode failed for "$input": $e');
       }
       return null;
     }
@@ -3122,49 +2558,7 @@ class PlayerController extends Notifier<PlayerState> {
 
   Future<void> _safeSeekTo(int position) async {
     if (position <= 0) return;
-
-    // ExoPlayer path: seek directly; no media_kit stream to wait on.
-    if (state.useExoPlayer && _videoViewController != null) {
-      try {
-        _videoViewController!.seekTo(position);
-      } catch (e) {
-        if (kDebugMode) debugPrint("ExoPlayer seek failed: $e");
-      }
-      return;
-    }
-
-    // media_kit path: wait for duration to be known before seeking.
-    try {
-      var duration = _player.state.duration;
-      if (duration == Duration.zero) {
-        duration = await _player.stream.duration
-            .firstWhere((d) => d != Duration.zero)
-            .timeout(const Duration(seconds: 8));
-      }
-
-      final maxMs = duration.inMilliseconds;
-      if (maxMs <= 0) return;
-
-      final targetMs = position.clamp(0, maxMs);
-      await _player.seek(Duration(milliseconds: targetMs));
-    } on TimeoutException catch (e) {
-      if (kDebugMode) {
-        debugPrint("Timeout waiting for duration: $e");
-      }
-
-      // Best-effort fallback: some streams can seek before duration is reported.
-      try {
-        await _player.seek(Duration(milliseconds: position));
-      } catch (seekError) {
-        if (kDebugMode) {
-          debugPrint("Fallback seek failed: $seekError");
-        }
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        debugPrint("Seek failed: $e");
-      }
-    }
+    _player.seek(position: position);
   }
 
   Future<void> _flushPendingResumeSeek() async {
@@ -3182,69 +2576,28 @@ class PlayerController extends Notifier<PlayerState> {
 
   Future<void> setPlaybackSpeed(double rate) async {
     final appliedRate = rate.clamp(0.5, state.maxPlaybackSpeed);
-
-    if (state.useExoPlayer && _videoViewController != null) {
-      _videoViewController!.setSpeed(appliedRate);
-      state = state.copyWith(playbackSpeed: appliedRate);
-      return;
-    }
-
-    await _player.setRate(appliedRate);
+    _player.playbackRate = appliedRate;
     state = state.copyWith(playbackSpeed: appliedRate);
   }
 
   Future<void> setSubtitleDelay(double seconds) async {
     if (!state.supportsSubtitleDelay) return;
 
-    final native = _player.platform;
-    if (native is NativePlayer) {
-      await native.setProperty('sub-delay', seconds.toString());
-      state = state.copyWith(subtitleDelay: seconds);
-    }
+    // FVP/MDK subtitle delay property (if supported by demuxer)
+    _player.setProperty('subtitle.delay', (seconds * 1000).toInt().toString());
+    state = state.copyWith(subtitleDelay: seconds);
   }
 
   Future<void> applySubtitleSettings() async {
     if (_isDisposed || !state.supportsSubtitleStyling) return;
 
-    final native = _player.platform;
-    if (native is NativePlayer) {
-      final settings =
-          ref.read(playerSettingsProvider).asData?.value ??
-          const PlayerSettings();
+    final settings =
+        ref.read(playerSettingsProvider).asData?.value ??
+        const PlayerSettings();
 
-      // MPV sub properties
-      await native.setProperty(
-        'sub-font-size',
-        settings.subtitleSize.toString(),
-      );
-      await native.setProperty(
-        'sub-pos',
-        settings.subtitlePosition.round().toString(),
-      );
-
-      // Colors are in MPV hex format (e.g. #RRGGBB or #AARRGGBB)
-      String colorToMpvHex(int color, [double opacity = 1.0]) {
-        final alpha = (opacity * 255).toInt().toRadixString(16).padLeft(2, '0');
-        final rgb = color.toRadixString(16).padLeft(8, '0').substring(2);
-        return '#$alpha$rgb';
-      }
-
-      await native.setProperty(
-        'sub-color',
-        colorToMpvHex(settings.subtitleColor),
-      );
-      if (settings.subtitleBackgroundColor != 0x00000000) {
-        await native.setProperty(
-          'sub-back-color',
-          colorToMpvHex(
-            settings.subtitleBackgroundColor,
-            settings.subtitleBackgroundOpacity,
-          ),
-        );
-      } else {
-        await native.setProperty('sub-back-color', '#00000000');
-      }
-    }
+    // In media_kit this used mpv's `sub-color` properties.
+    // FVP/libmdk handles subtitle styling natively via ASS style overrides or global options.
+    // For now, styling is deferred to the native subtitle renderer without crashing.
   }
 
   Future<double> _getSystemVolumeLevel() async {
@@ -3259,11 +2612,7 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   double _getEngineVolumeLevel() {
-    if (state.useExoPlayer && _videoViewController != null) {
-      return _videoViewController!.volume.value.clamp(0.0, 1.0);
-    }
-
-    return (_player.state.volume / 100).clamp(0.0, 2.0);
+    return _player.volume;
   }
 
   Future<void> _setSystemVolumeLevel(double value) async {
@@ -3273,12 +2622,7 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   Future<void> _setEngineVolumeLevel(double value) async {
-    if (state.useExoPlayer && _videoViewController != null) {
-      _videoViewController!.setVolume(value.clamp(0.0, 1.0));
-      return;
-    }
-
-    await _player.setVolume((value * 100).clamp(0.0, 200.0));
+    _player.volume = value.clamp(0.0, 1.0);
   }
 
   Future<double> getVolumeLevel() async {
@@ -3327,10 +2671,6 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   Future<void> loadExternalSubtitleFile({String? filePath}) async {
-    if (state.useExoPlayer && !state.supportsExternalSubtitleLoading) {
-      return;
-    }
-
     String? path = filePath;
     if (path == null) {
       final result = await FilePicker.pickFiles(
@@ -3361,26 +2701,6 @@ class PlayerController extends Notifier<PlayerState> {
             state.currentStream?.subtitles,
           ),
         );
-      }
-
-      if (state.useExoPlayer && state.currentStream != null) {
-        _pendingVideoViewSubtitleIdsBeforeReload = _videoViewController
-            ?.mediaInfo
-            .value
-            ?.subtitleTracks
-            .keys
-            .toSet();
-        _selectNewestVideoViewSubtitleAfterReload =
-            !(Platform.isMacOS || Platform.isIOS);
-
-        await changeStream(state.currentStream!, resetPosition: false);
-
-        if (!state.useExoPlayer) {
-          _pendingVideoViewSubtitleIdsBeforeReload = null;
-          _selectNewestVideoViewSubtitleAfterReload = false;
-          await selectSubtitleTrack('external:${newSub.url}');
-        }
-        return;
       }
 
       await selectSubtitleTrack('external:${newSub.url}');
