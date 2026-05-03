@@ -82,7 +82,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
       native.setProperty('force-seekable', 'yes');
       // Increase metadata probing depth to match VLC (resolves missing language tags)
       native.setProperty('demuxer-lavf-probesize', '33554432'); // 32MB
-      native.setProperty('demuxer-lavf-analyzeduration', '20'); // 20s
+      // 30s covers the worst-case HLS segment duration; shorter values cause
+      // mpv to miss video tracks in streams with 30s segments.
+      native.setProperty('demuxer-lavf-analyzeduration', '30');
+      // Enable verbose HLS/lavf logging in debug so variant selection and
+      // segment fetch errors are visible in logcat.
+      if (kDebugMode) {
+        native.setProperty('msg-level', 'hls=v,lavf=v,ffmpeg/demuxer=v');
+      }
     }
     _videoController = VideoController(_player);
 
@@ -179,7 +186,8 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     // Only handle KeyDown and KeyRepeat for volume/seeking
-    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent)
+      return KeyEventResult.ignored;
 
     // TV Navigation Logic
     if (_isTv) {
@@ -293,12 +301,18 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Icon(Icons.error_outline, color: Colors.red, size: 56),
+                      const Icon(
+                        Icons.error_outline,
+                        color: Colors.red,
+                        size: 56,
+                      ),
                       const SizedBox(height: 16),
                       Text(
                         AppLocalizations.of(context)!.playbackError,
                         style: const TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.bold),
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Text(
@@ -322,11 +336,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
               Positioned(
                 top: 8,
                 left: 8,
-                  child: IconButton(
-                    icon: const Icon(Icons.arrow_back),
-                    tooltip: AppLocalizations.of(context)!.goBack,
-                    onPressed: _handleBack,
-                  ),
+                child: IconButton(
+                  icon: const Icon(Icons.arrow_back),
+                  tooltip: AppLocalizations.of(context)!.goBack,
+                  onPressed: _handleBack,
+                ),
               ),
             ],
           ),
@@ -345,9 +359,10 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
             // visible and video is playing), so the user doesn't exit by accident.
             // On phone/tablet: always pop directly — no two-step back.
             if (_isTv && _controlsVisible.value) {
-              final isPlaying = ref.read(
-                playerControllerProvider.select((s) => s.useExoPlayer),
-              )
+              final isPlaying =
+                  ref.read(
+                    playerControllerProvider.select((s) => s.useExoPlayer),
+                  )
                   ? _videoViewController.playbackState.value ==
                         vv.VideoControllerPlaybackState.playing
                   : _player.state.playing;

@@ -207,6 +207,40 @@ class JsEngineService {
               }
             });
 
+      case 'http_parallel':
+        final parsed = jsonDecode(argsJson) as Map<String, dynamic>;
+        final jsId = parsed['id'] as String?;
+        final requests = (parsed['requests'] as List)
+            .cast<Map<String, dynamic>>();
+
+        Future.wait(
+              requests.map(
+                (r) => _handleHttp(jsonEncode(r), cancelToken: cancelToken),
+              ),
+            )
+            .then((results) {
+              if (jsId != null) {
+                _workerPort.send({
+                  _mBridgeResp: 1,
+                  'bid': bid,
+                  'jsId': jsId,
+                  'rj': jsonEncode(results),
+                  'err': false,
+                });
+              }
+            })
+            .catchError((Object e) {
+              if (jsId != null) {
+                _workerPort.send({
+                  _mBridgeResp: 1,
+                  'bid': bid,
+                  'jsId': jsId,
+                  'rj': jsonEncode(e.toString()),
+                  'err': true,
+                });
+              }
+            });
+
       case 'get_storage':
         final parsed = jsonDecode(argsJson) as Map<String, dynamic>;
         final jsId = parsed['id'] as String?;

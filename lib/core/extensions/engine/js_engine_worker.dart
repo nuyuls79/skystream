@@ -15,31 +15,33 @@ import 'package:html/dom.dart' as html_dom;
 import 'package:encrypt/encrypt.dart' as encrypt_lib;
 import 'package:pointycastle/export.dart';
 import 'package:crypto/crypto.dart' as crypto_lib;
+import '../utils/js_unpacker.dart';
 
 // ── Message type keys (short to minimise serialisation overhead) ─────────────
 
 // Main → Worker
-const _mLoadScript    = 'ls'; // {ls:1, id:int, payload:String, tag:String?}
-const _mLoadBytes     = 'lb'; // {lb:1, id:int, payload:Uint8List, tag:String?}
-const _mInvoke        = 'iv'; // {iv:1, id:int, fn:String, aj:String}
-const _mCancelInvoke  = 'ci'; // {ci:1, id:int}
-const _mCancelTag     = 'ct'; // {ct:String}
-const _mBridgeResp    = 'br'; // {br:1, bid:int, jsId:String, rj:String, err:bool}
-const _mDispose       = 'dp';
-const _mGc            = 'gc';
+const _mLoadScript = 'ls'; // {ls:1, id:int, payload:String, tag:String?}
+const _mLoadBytes = 'lb'; // {lb:1, id:int, payload:Uint8List, tag:String?}
+const _mInvoke = 'iv'; // {iv:1, id:int, fn:String, aj:String}
+const _mCancelInvoke = 'ci'; // {ci:1, id:int}
+const _mCancelTag = 'ct'; // {ct:String}
+const _mBridgeResp = 'br'; // {br:1, bid:int, jsId:String, rj:String, err:bool}
+const _mDispose = 'dp';
+const _mGc = 'gc';
 
 // Worker → Main
-const _mReady         = 'rd'; // {rd:SendPort}
-const _mLoadDone      = 'ld'; // {ld:int}
-const _mLoadErr       = 'le'; // {le:int, msg:String}
-const _mInvokeResult  = 'ir'; // {ir:int, result:dynamic}
+const _mReady = 'rd'; // {rd:SendPort}
+const _mLoadDone = 'ld'; // {ld:int}
+const _mLoadErr = 'le'; // {le:int, msg:String}
+const _mInvokeResult = 'ir'; // {ir:int, result:dynamic}
 // _mInvokeErr ('ie') is sent inline in _mInvokeResult with a non-null 'err' field
-const _mBridge        = 'bg'; // {bg:1, bid:int, ch:String, aj:String, iid:String?}
-const _mLog           = 'll'; // {ll:String, err:bool}
+const _mBridge = 'bg'; // {bg:1, bid:int, ch:String, aj:String, iid:String?}
+const _mLog = 'll'; // {ll:String, err:bool}
 
 // ── IO bridge channel names forwarded to main ────────────────────────────────
 const _ioBridges = {
   'http_request',
+  'http_parallel',
   'get_storage',
   'set_storage',
   'get_preference',
@@ -114,7 +116,11 @@ class _JsWorkerRunner {
     if (m.containsKey(_mLoadScript)) {
       _load(m['id'] as int, m['payload'] as String, m['tag'] as String?);
     } else if (m.containsKey(_mLoadBytes)) {
-      _loadBytes(m['id'] as int, m['payload'] as Uint8List, m['tag'] as String?);
+      _loadBytes(
+        m['id'] as int,
+        m['payload'] as Uint8List,
+        m['tag'] as String?,
+      );
     } else if (m.containsKey(_mInvoke)) {
       _invoke(m['id'] as int, m['fn'] as String, m['aj'] as String);
     } else if (m.containsKey(_mCancelInvoke)) {
@@ -161,7 +167,8 @@ class _JsWorkerRunner {
     _latestJsCbId = jsCbId;
     _incrementAsync();
 
-    final wrapper = '''
+    final wrapper =
+        '''
       (function() {
         try {
           var dart_cb = function(res) {
@@ -242,7 +249,9 @@ class _JsWorkerRunner {
         : _rt.evaluate(payload as String);
     if (completer != null) {
       if (res.isError) {
-        completer.completeError(Exception('JS Eval Error: ${res.stringResult}'));
+        completer.completeError(
+          Exception('JS Eval Error: ${res.stringResult}'),
+        );
       } else {
         completer.complete();
       }
@@ -353,7 +362,9 @@ class _JsWorkerRunner {
       final ch = channel; // capture
       _rt.onMessage(ch, (dynamic args) {
         final bid = _bridgeCnt++;
-        final argsMap = args is Map ? Map<String, dynamic>.from(args) : _toMap(args);
+        final argsMap = args is Map
+            ? Map<String, dynamic>.from(args)
+            : _toMap(args);
         _tx.send({
           _mBridge: 1,
           'bid': bid,
@@ -396,7 +407,9 @@ class _JsWorkerRunner {
         }
         _dom[id] = html_parser.parse(html);
         if (callbackId != null) {
-          _scheduleEval("_resolveDartAsync('$callbackId', ${jsonEncode(id)}, false)");
+          _scheduleEval(
+            "_resolveDartAsync('$callbackId', ${jsonEncode(id)}, false)",
+          );
         }
       });
       return null;
@@ -412,9 +425,7 @@ class _JsWorkerRunner {
         final node = _dom[nodeId];
         if (node == null) return null;
         if (multi) {
-          return _querySelectorAll(node, query)
-              .map(_serializeElement)
-              .toList();
+          return _querySelectorAll(node, query).map(_serializeElement).toList();
         }
         final results = _querySelectorAll(node, query);
         return results.isNotEmpty ? _serializeElement(results.first) : null;
@@ -487,7 +498,8 @@ class _JsWorkerRunner {
         final group = (data['group'] as int?) ?? 0;
         final cs = data['caseSensitive'] as bool? ?? true;
         final regex = RegExp(pattern, caseSensitive: cs);
-        return regex.allMatches(text)
+        return regex
+            .allMatches(text)
             .map<String?>((m) => m.group(group))
             .whereType<String>()
             .toList();
@@ -525,7 +537,9 @@ class _JsWorkerRunner {
 
     _rt.onMessage('crypto_sha256', (dynamic args) {
       try {
-        return crypto_lib.sha256.convert(utf8.encode(args.toString())).toString();
+        return crypto_lib.sha256
+            .convert(utf8.encode(args.toString()))
+            .toString();
       } catch (_) {
         return null;
       }
@@ -537,24 +551,40 @@ class _JsWorkerRunner {
       try {
         String norm(String s) {
           String c = s.replaceAll(RegExp(r'\s+'), '');
-          while (c.length % 4 != 0) { c += '='; }
+          while (c.length % 4 != 0) {
+            c += '=';
+          }
           return c;
         }
-        final keyToken = encrypt_lib.Key.fromBase64(norm(data['key'] as String));
+
+        final keyToken = encrypt_lib.Key.fromBase64(
+          norm(data['key'] as String),
+        );
         final ivToken = encrypt_lib.IV.fromBase64(norm(data['iv'] as String));
         final mode = (data['mode'] as String? ?? 'cbc').toLowerCase();
-        final aesMode = mode == 'gcm' ? encrypt_lib.AESMode.gcm : encrypt_lib.AESMode.cbc;
-        final encrypter = encrypt_lib.Encrypter(encrypt_lib.AES(keyToken, mode: aesMode));
-        final decrypted = encrypter.decrypt64(norm(data['data'] as String), iv: ivToken);
+        final aesMode = mode == 'gcm'
+            ? encrypt_lib.AESMode.gcm
+            : encrypt_lib.AESMode.cbc;
+        final encrypter = encrypt_lib.Encrypter(
+          encrypt_lib.AES(keyToken, mode: aesMode),
+        );
+        final decrypted = encrypter.decrypt64(
+          norm(data['data'] as String),
+          iv: ivToken,
+        );
         if (callbackId != null) {
-          _scheduleEval("_resolveDartAsync('$callbackId', ${jsonEncode(decrypted)}, false)");
+          _scheduleEval(
+            "_resolveDartAsync('$callbackId', ${jsonEncode(decrypted)}, false)",
+          );
         }
       } catch (e) {
         if (callbackId != null) {
           final msg = e is FormatException
               ? 'Invalid base64 format'
               : e.toString();
-          _scheduleEval("_resolveDartAsync('$callbackId', ${jsonEncode(msg)}, true)");
+          _scheduleEval(
+            "_resolveDartAsync('$callbackId', ${jsonEncode(msg)}, true)",
+          );
         }
       }
       return null;
@@ -570,16 +600,68 @@ class _JsWorkerRunner {
         final keyLen = (data['keyLength'] as int?) ?? 32;
         final derivator = PBKDF2KeyDerivator(HMac(SHA256Digest(), 64))
           ..init(Pbkdf2Parameters(salt, iterations, keyLen));
-        final result = derivator.process(Uint8List.fromList(utf8.encode(password)));
+        final result = derivator.process(
+          Uint8List.fromList(utf8.encode(password)),
+        );
         final b64 = base64Encode(result);
         if (callbackId != null) {
-          _scheduleEval("_resolveDartAsync('$callbackId', ${jsonEncode(b64)}, false)");
+          _scheduleEval(
+            "_resolveDartAsync('$callbackId', ${jsonEncode(b64)}, false)",
+          );
         }
       } catch (e) {
         if (callbackId != null) {
-          _scheduleEval("_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)");
+          _scheduleEval(
+            "_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)",
+          );
         }
       }
+      return null;
+    });
+
+    _rt.onMessage('js_unpack', (dynamic args) {
+      try {
+        final jsStr = args.toString();
+        return DartJsUnpacker(jsStr).unpack() ?? jsStr;
+      } catch (_) {
+        return args.toString();
+      }
+    });
+
+    _rt.onMessage('parse_html', (dynamic args) {
+      final data = _toMap(args);
+      final callbackId = data['id'] as String?;
+      final htmlStr = data['html'] as String? ?? '';
+      final selector = data['selector'] as String? ?? '*';
+      final attr = data['attr'] as String?;
+
+      Future.microtask(() {
+        try {
+          final doc = html_parser.parse(htmlStr);
+          final elems = doc.querySelectorAll(selector);
+          final result = elems
+              .map(
+                (el) => {
+                  'text': el.text,
+                  'html': el.innerHtml,
+                  'attr': attr != null ? (_extractAttr(el, attr) ?? '') : '',
+                },
+              )
+              .toList();
+
+          if (callbackId != null) {
+            _scheduleEval(
+              "_resolveDartAsync('$callbackId', ${jsonEncode(result)}, false)",
+            );
+          }
+        } catch (e) {
+          if (callbackId != null) {
+            _scheduleEval(
+              "_resolveDartAsync('$callbackId', ${jsonEncode(e.toString())}, true)",
+            );
+          }
+        }
+      });
       return null;
     });
 
@@ -669,12 +751,18 @@ class _JsWorkerRunner {
 
   static String? _extractAttr(html_dom.Element el, String attr) {
     switch (attr) {
-      case 'textContent': return el.text;
-      case 'innerHTML':   return el.innerHtml;
-      case 'outerHTML':   return el.outerHtml;
-      case 'tagName':     return el.localName;
-      case 'className':   return el.className;
-      default:            return el.attributes[attr];
+      case 'textContent':
+        return el.text;
+      case 'innerHTML':
+        return el.innerHtml;
+      case 'outerHTML':
+        return el.outerHtml;
+      case 'tagName':
+        return el.localName;
+      case 'className':
+        return el.className;
+      default:
+        return el.attributes[attr];
     }
   }
 
@@ -800,6 +888,15 @@ const _kPolyfillJs = r"""
       if (cb && typeof cb === 'function') cb(res);
       return res;
     });
+  };
+  globalThis.http_parallel = function(requests) {
+    return _dartAsyncCall('http_parallel', { requests: requests });
+  };
+  globalThis.getAndUnpack = function(js) {
+    return sendMessage('js_unpack', js);
+  };
+  globalThis.parse_html = function(html, selector, attr) {
+    return _dartAsyncCall('parse_html', { html: html, selector: selector, attr: attr });
   };
   async function _fetch(url) { return await http_get(url, {}); }
 """;
