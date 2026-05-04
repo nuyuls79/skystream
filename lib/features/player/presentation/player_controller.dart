@@ -3169,11 +3169,11 @@ class PlayerController extends Notifier<PlayerState> {
             stream.url.toLowerCase().contains('.m3u8') ||
             stream.url.toLowerCase().contains('/hls/');
         if (isHlsStream) {
-          // 5MB covers a full 1080p fMP4 video segment (~4-8Mbps × 1s) for
-          // codec detection without reading multiple segments per track.
-          // 5s is enough for EXT-X-MEDIA / EXT-X-MAP based HLS streams.
-          await native.setProperty('demuxer-lavf-probesize', '5242880'); // 5MB
-          await native.setProperty('demuxer-lavf-analyzeduration', '5'); // 5s
+          // 5 MB covers a full 1080p fMP4 video segment for codec detection.
+          // 2 s per rendition keeps startup fast even with many audio tracks
+          // (e.g. 11 tracks × 2 s ≈ 22 s worst-case; fast CDNs finish sooner).
+          await native.setProperty('demuxer-lavf-probesize', '5242880'); // 5 MB
+          await native.setProperty('demuxer-lavf-analyzeduration', '2'); // 2 s
         } else {
           await native.setProperty(
             'demuxer-lavf-probesize',
@@ -3290,11 +3290,9 @@ class PlayerController extends Notifier<PlayerState> {
     Map<String, String> headers,
     ProxyOptions proxyOptions,
   ) async {
-    // Probe-time guard: each audio rendition adds ~3-5 s to FFmpeg's probe phase.
-    // Three renditions covers primary + secondary language + fallback while
-    // keeping startup time under ~15 s. Streams with more renditions (e.g. 11)
-    // only expose the top three.
-    const maxAudioTracks = 3;
+    // No hard limit on audio tracks — we proxy ALL renditions so auth cookies
+    // reach every track. Probe time is controlled by demuxer-lavf-analyzeduration
+    // (set to 2 s for HLS below); worst case N tracks × 2 s = manageable startup.
 
     try {
       final response = await http.get(Uri.parse(masterUrl), headers: headers);
@@ -3332,9 +3330,9 @@ class PlayerController extends Notifier<PlayerState> {
         allAudio.add((t, score));
       }
 
-      // Sort descending by score; slice to limit.
+      // Sort descending by score; keep all (lang-preferred first, then DEFAULT).
       allAudio.sort((a, b) => b.$2.compareTo(a.$2));
-      final kept = allAudio.take(maxAudioTracks).toList();
+      final kept = allAudio;
 
       // Rebuild the playlist, replacing audio lines in score-sorted order.
       final result = <String>[];

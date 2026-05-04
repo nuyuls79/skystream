@@ -364,6 +364,8 @@ class SkyStreamPlayerControlsState
   }
 
   Future<void> _handleDoubleTap() async {
+    if (_isLocked) return;
+
     // Desktop Double Tap -> Toggle Fullscreen
     try {
       if (context.isDesktop &&
@@ -517,11 +519,9 @@ class SkyStreamPlayerControlsState
       _isLocked = !_isLocked;
       _isVisible = true;
     });
-    if (!_isLocked) {
-      _startHideTimer();
-    } else {
-      _hideTimer?.cancel();
-    }
+    // Always start the hide timer: when unlocked, controls auto-hide as normal;
+    // when locked, only the unlock button is visible and should also auto-hide.
+    _startHideTimer();
   }
 
   // Keyboard shortcut handlers
@@ -564,20 +564,24 @@ class SkyStreamPlayerControlsState
   }
 
   Future<void> _handleDragStart(DragStartDetails details) async {
+    if (_isLocked) return;
     final size = MediaQuery.sizeOf(context);
     await ref.read(playerGestureHandlerProvider.notifier).handleDragStart(details, size.width, size.height);
   }
 
   void _handleDragUpdate(DragUpdateDetails details) {
+    if (_isLocked) return;
     ref.read(playerGestureHandlerProvider.notifier).handleDragUpdate(details);
   }
 
   void _handleDragEnd(DragEndDetails details) {
+    if (_isLocked) return;
     ref.read(playerGestureHandlerProvider.notifier).handleDragEnd(details);
   }
 
   // Horizontal Seek
   Future<void> _handleHorizontalDragStart(DragStartDetails details) async {
+    if (_isLocked) return;
     final size = MediaQuery.sizeOf(context);
     final bottomPadding = MediaQuery.viewPaddingOf(context).bottom;
     await ref.read(playerGestureHandlerProvider.notifier).handleHorizontalDragStart(
@@ -590,10 +594,12 @@ class SkyStreamPlayerControlsState
   }
 
   void _handleHorizontalDragUpdate(DragUpdateDetails details) {
+    if (_isLocked) return;
     ref.read(playerGestureHandlerProvider.notifier).handleHorizontalDragUpdate(details);
   }
 
   void _handleHorizontalDragEnd(DragEndDetails details) {
+    if (_isLocked) return;
     ref.read(playerGestureHandlerProvider.notifier).handleHorizontalDragEnd(details);
   }
 
@@ -774,6 +780,7 @@ class SkyStreamPlayerControlsState
             if (_isLocked) {
               setState(() => _isVisible = !_isVisible);
               widget.onVisibilityChanged?.call(_isVisible);
+              if (_isVisible) _startHideTimer();
             } else {
               _toggleVisibility();
             }
@@ -865,8 +872,8 @@ class SkyStreamPlayerControlsState
 
                 // Episode Sidebar Overlay
                 if (isSeries) ...[
-                  // Edge Arrow Toggle (only when controls are visible and list is closed)
-                  if (_isVisible && !showEpisodeList)
+                  // Edge Arrow Toggle (only when controls are visible, list is closed, and not locked)
+                  if (_isVisible && !showEpisodeList && !_isLocked)
                     Positioned(
                       right: 0,
                       top: 0,
@@ -912,7 +919,7 @@ class SkyStreamPlayerControlsState
                       item: ref
                           .read(playerControllerProvider.notifier)
                           .multimediaItem!,
-                      isVisible: showEpisodeList,
+                      isVisible: showEpisodeList && !_isLocked,
                       isTv: _isTv,
                       onDismiss: () => ref
                           .read(playerControllerProvider.notifier)
