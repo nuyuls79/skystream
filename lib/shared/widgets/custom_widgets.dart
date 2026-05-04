@@ -3,20 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../core/utils/layout_constants.dart';
 
-/// Wraps [child] inside a [Shortcuts] that remaps D-pad arrow keys (up/down)
-/// to plain focus traversal intents.  Place this as the direct child of a
-/// [RadioGroup] to prevent the group from auto-selecting the focused option
-/// when the user navigates with a TV remote — selection still fires on Enter.
-Widget tvRadioFocusShortcuts({required Widget child}) {
-  return Shortcuts(
-    shortcuts: const <ShortcutActivator, Intent>{
-      SingleActivator(LogicalKeyboardKey.arrowDown): NextFocusIntent(),
-      SingleActivator(LogicalKeyboardKey.arrowUp): PreviousFocusIntent(),
-    },
-    child: child,
-  );
-}
-
 /// A Slider widget that handles D-pad navigation properly on TV.
 /// Left/Right D-pad adjusts the value, Up/Down D-pad navigates to other focusable elements.
 class CustomSlider extends StatefulWidget {
@@ -280,19 +266,17 @@ class _CustomTextFieldState extends State<CustomTextField> {
 
     final focusedBorder = OutlineInputBorder(
       borderRadius: BorderRadius.circular(12),
-      borderSide: BorderSide(
-        color: colorScheme.primary,
-        width: 2,
-      ),
+      borderSide: BorderSide(color: colorScheme.primary, width: 2),
     );
 
     // Merge the provided decoration with our consistent styling
-    final effectiveDecoration = (widget.decoration ?? const InputDecoration()).copyWith(
-      hintText: widget.hintText ?? widget.decoration?.hintText,
-      enabledBorder: widget.decoration?.enabledBorder ?? enabledBorder,
-      focusedBorder: widget.decoration?.focusedBorder ?? focusedBorder,
-      border: widget.decoration?.border ?? enabledBorder,
-    );
+    final effectiveDecoration = (widget.decoration ?? const InputDecoration())
+        .copyWith(
+          hintText: widget.hintText ?? widget.decoration?.hintText,
+          enabledBorder: widget.decoration?.enabledBorder ?? enabledBorder,
+          focusedBorder: widget.decoration?.focusedBorder ?? focusedBorder,
+          border: widget.decoration?.border ?? enabledBorder,
+        );
 
     return TextField(
       focusNode: _focusNode,
