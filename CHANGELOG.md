@@ -1,4 +1,4 @@
-## Changelogs - v2.2.8
+## Changelogs - v2.3.0
 
 ### ✨ *New Features *
 - ⚡ *JS Bytecode Support* – Added bytecode compilation for better performance and faster execution  
