@@ -234,7 +234,8 @@ class LocalProxyService {
             lowerName != 'connection' &&
             lowerName != 'accept-encoding' &&
             lowerName != 'referer' &&
-            lowerName != 'user-agent') {
+            lowerName != 'user-agent' &&
+            lowerName != 'icy-metadata') {
           for (final value in values) {
             req.headers.add(name, value);
           }
@@ -313,11 +314,41 @@ class LocalProxyService {
         debugPrint("[PROXY] Detected isM3u8: $isResponseM3u8 for $targetUrl");
       }
 
+      // Detect CDN edge gzip-decompression mismatch: some CDNs (e.g. Cloudflare
+      // when origin storage is gzipped) reply to a Range request with status
+      // 206, Transfer-Encoding: chunked, and a content-range header that
+      // reports the COMPRESSED file size while the chunked body delivers the
+      // DECOMPRESSED bytes. mpv/FFmpeg trusts the content-range total and
+      // truncates reads at the bogus size, producing partial AAC/h264 frames
+      // and decoder errors. Diagnostic: 206 + chunked + content-range without
+      // content-length. In that case the response is effectively the full
+      // file, so convert to 200 and drop the misleading content-range.
+      final hasChunkedEncoding = response.headers
+              .value('transfer-encoding')
+              ?.toLowerCase()
+              .contains('chunked') ==
+          true;
+      final hasContentRange =
+          response.headers.value('content-range') != null;
+      final hasContentLength =
+          response.headers.value('content-length') != null;
+      final misleadingContentRange = !isResponseM3u8 &&
+          response.statusCode == 206 &&
+          hasChunkedEncoding &&
+          hasContentRange &&
+          !hasContentLength;
+      if (kDebugMode && misleadingContentRange) {
+        debugPrint(
+          '[PROXY] Detected CDN edge-decompression mismatch — converting '
+          '206→200 and dropping content-range for $targetUrl',
+        );
+      }
+
       request.response.statusCode =
           (isResponseM3u8 &&
               (response.statusCode == 200 || response.statusCode == 206))
           ? 200
-          : response.statusCode;
+          : (misleadingContentRange ? 200 : response.statusCode);
 
       // Dart's autoUncompress=true decompresses gzip bodies but does NOT update
       // Content-Length (still shows compressed size) or remove Content-Encoding.
@@ -347,6 +378,8 @@ class LocalProxyService {
         // Forwarding "Content-Encoding: gzip" with a plain body causes mpv to
         // attempt decompression and corrupt the data.
         if (lowerName == 'content-encoding' && wasGzip) return;
+        // Drop the lying content-range from CDN edge-decompression mismatch.
+        if (lowerName == 'content-range' && misleadingContentRange) return;
         for (final value in values) {
           request.response.headers.add(name, value);
         }

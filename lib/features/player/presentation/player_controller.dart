@@ -3154,7 +3154,10 @@ class PlayerController extends Notifier<PlayerState> {
         // seeks and has to re-read forward to reach the target position.
         // force-seekable=yes is a belt-and-suspenders override at the player
         // level; seekable=1 fixes it at the stream/demuxer level.
-        await native.setProperty('stream-lavf-o', 'seekable=1');
+        // icy=0 disables FFmpeg's SHOUTcast/ICY detection header
+        // (Icy-MetaData: 1) which some CDNs interpret as an audio-only ICY
+        // stream request, causing 29-second audio-without-video playback.
+        await native.setProperty('stream-lavf-o', 'seekable=1,icy=0');
         await native.setProperty('force-seekable', 'yes');
 
         // Force mpv to select the highest-bandwidth HLS variant so it never
@@ -3166,6 +3169,7 @@ class PlayerController extends Notifier<PlayerState> {
         // its whitelist, causing audio-only playback when video segments use
         // non-standard extensions.
         demuxerLavfOpts.add('allowed_extensions=ALL');
+        demuxerLavfOpts.add('icy=0'); // suppress Icy-MetaData:1 on segment fetches too
 
         // HLS manifests declare codec/language via EXT-X-MEDIA and EXT-X-MAP
         // tags, so FFmpeg doesn't need deep probing to detect streams. The
