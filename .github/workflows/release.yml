@@ -307,7 +307,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022
             arch: x64
             torrserver_binary: TorrServer-windows-amd64.exe
     steps:
